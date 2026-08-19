@@ -1,0 +1,71 @@
+name: Sync upstream and preserve VTO patch
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/rroller/dahua.git 2>/dev/null || true
+          git fetch upstream main
+
+      - name: Merge upstream
+        run: |
+          git merge upstream/main --no-edit
+
+      - name: Ensure VTO backchannel patch is present
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("custom_components/dahua/camera.py")
+          text = path.read_text()
+
+          source_line = (
+              "        self._stream_source = "
+              "coordinator.client.get_rtsp_stream_url(self._channel_number, stream_index)\n"
+          )
+          patched_block = (
+              source_line
+              + "        if coordinator.is_doorbell():\n"
+              + "            self._stream_source += \"#backchannel=0\"\n"
+          )
+
+          if "#backchannel=0" not in text:
+              if source_line not in text:
+                  raise SystemExit(
+                      "RTSP stream-source line changed upstream; refusing to patch automatically"
+                  )
+              text = text.replace(source_line, patched_block, 1)
+              path.write_text(text)
+          PY
+
+      - name: Commit preserved patch if needed
+        run: |
+          git add custom_components/dahua/camera.py
+          if ! git diff --cached --quiet; then
+            git commit -m "Preserve VTO backchannel patch after upstream sync"
+          fi
+
+      - name: Push fork
+        run: |
+          git push origin main
