@@ -215,7 +215,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry, async_add_entitie
 
     # Exposes a service to enable setting the cameras infrared light to Auto, Manual, and Off along with the brightness
     if coordinator.supports_infrared_light():
-        # "async_set_infrared_mode" is the method called upon calling the service. Defined below in DahuaCamera class
+        # "async_set_infrared_mode" is the method called upon calling the service. Defined below in the DahuaCamera class
         platform.async_register_entity_service(
             SERVICE_SET_INFRARED_MODE,
             {
@@ -249,6 +249,8 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         self._stream_index = stream_index
         self._motion_status = False
         self._stream_source = coordinator.client.get_rtsp_stream_url(self._channel_number, stream_index)
+        if coordinator.is_doorbell():
+            self._stream_source += "#backchannel=0"
         self._attr_frontend_stream_type = StreamType.WEB_RTC
 
     @property
