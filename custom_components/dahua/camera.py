@@ -293,6 +293,8 @@ class DahuaCamera(DahuaBaseEntity, Camera):
         self._stream_source = coordinator.client.get_rtsp_stream_url(
             self._channel_number, stream_index
         )
+        if coordinator.is_doorbell():
+            self._stream_source += "#backchannel=0"
         self._attr_frontend_stream_type = StreamType.WEB_RTC
 
     @property
