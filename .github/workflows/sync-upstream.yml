@@ -30,32 +30,40 @@ jobs:
 
       - name: Merge upstream
         run: |
-          git merge upstream/main --no-edit
+          # The fork intentionally carries a tiny VTO-only change in camera.py.
+          # Upstream also edits this area, so let upstream win only for conflicting
+          # hunks; the VTO patch is reapplied in the next step.
+          git merge upstream/main --no-edit -X theirs
 
       - name: Ensure VTO backchannel patch is present
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("custom_components/dahua/camera.py")
           text = path.read_text()
 
-          source_line = (
-              "        self._stream_source = "
-              "coordinator.client.get_rtsp_stream_url(self._channel_number, stream_index)\n"
-          )
-          patched_block = (
-              source_line
-              + "        if coordinator.is_doorbell():\n"
-              + "            self._stream_source += \"#backchannel=0\"\n"
-          )
-
           if "#backchannel=0" not in text:
-              if source_line not in text:
+              # Match the RTSP stream-source assignment even if upstream reformats
+              # the get_rtsp_stream_url() call across multiple lines.
+              pattern = re.compile(
+                  r'(?m)^        self\\._stream_source = '
+                  r'coordinator\\.client\\.get_rtsp_stream_url\\(.*?^        \\)\\n',
+                  re.DOTALL,
+              )
+              match = pattern.search(text)
+              if not match:
                   raise SystemExit(
-                      "RTSP stream-source line changed upstream; refusing to patch automatically"
+                      "RTSP stream-source assignment changed upstream; refusing to patch automatically"
                   )
-              text = text.replace(source_line, patched_block, 1)
+
+              patched_block = (
+                  match.group(0)
+                  + "        if coordinator.is_doorbell():\n"
+                  + "            self._stream_source += \"#backchannel=0\"\n"
+              )
+              text = text[:match.start()] + patched_block + text[match.end():]
               path.write_text(text)
           PY
 
