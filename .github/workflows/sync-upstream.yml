@@ -31,8 +31,8 @@ jobs:
       - name: Merge upstream
         run: |
           # The fork intentionally carries a tiny VTO-only change in camera.py.
-          # Upstream also edits this area, so let upstream win only for conflicting
-          # hunks; the VTO patch is reapplied in the next step.
+          # Upstream also edits this area, so let upstream win conflicting hunks;
+          # the VTO patch is reapplied in the next step.
           git merge upstream/main --no-edit -X theirs
 
       - name: Ensure VTO backchannel patch is present
@@ -48,8 +48,8 @@ jobs:
               # Match the RTSP stream-source assignment even if upstream reformats
               # the get_rtsp_stream_url() call across multiple lines.
               pattern = re.compile(
-                  r'(?m)^        self\\._stream_source = '
-                  r'coordinator\\.client\\.get_rtsp_stream_url\\(.*?^        \\)\\n',
+                  r'(?m)^        self\._stream_source = '
+                  r'coordinator\.client\.get_rtsp_stream_url\(.*?^        \)\n',
                   re.DOTALL,
               )
               match = pattern.search(text)
