@@ -17,14 +17,13 @@ from aiohttp import ClientError, ClientResponseError, ClientSession, TCPConnecto
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 
 from . import dahua_utils
-from .client import DahuaClient
+from .client import DahuaClient, clear_host_cache
 from .model_profiles import is_sdt4e425
 
 from .const import (
@@ -62,6 +61,21 @@ EVENT_STREAM_JITTER = 0.1
 # The same applies after a failure: a device that rejected every channel at once
 # would otherwise be retried by every channel at once, sixty seconds later.
 EVENT_STREAM_RETRY_SECONDS = 60
+
+# A stream that lived this long was working, so reconnect at once. Anything
+# shorter gets backed off, because the fast path used to have no delay at all:
+# a device closing the socket at eleven seconds reconnected forever, silently.
+EVENT_STREAM_HEALTHY_SECONDS = 60
+EVENT_STREAM_SHORT_RETRY_SECONDS = 10
+
+
+def event_stream_retry_delay(lived_seconds: float) -> float:
+    """How long to wait before re-attaching, given how long the stream lasted."""
+    if lived_seconds < 10:
+        return jittered(EVENT_STREAM_RETRY_SECONDS)
+    if lived_seconds < EVENT_STREAM_HEALTHY_SECONDS:
+        return jittered(EVENT_STREAM_SHORT_RETRY_SECONDS)
+    return 0.0
 
 
 def jittered(seconds: float, fraction: float = EVENT_STREAM_JITTER) -> float:
@@ -130,11 +144,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     coordinator = DahuaDataUpdateCoordinator(hass, entry=entry, events=events, address=address, port=port,
                                              rtsp_port=rtsp_port, username=username, password=password, name=name,
                                              channel=channel, use_https=use_https)
-    await coordinator.async_config_entry_first_refresh()
-
-    if not coordinator.last_update_success:
-        _LOGGER.warning("dahua async_setup_entry for init, data not ready")
-        raise ConfigEntryNotReady
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception:
+        # The coordinator opens a session and takes a reference on the host's
+        # shared connection pool in its constructor, and only async_stop gives
+        # them back. Nothing reaches async_stop unless the coordinator makes it
+        # into hass.data, which a failed setup never does -- so without this,
+        # every retry against a device that is not answering leaks one session
+        # and one reference, forever, and Home Assistant retries forever.
+        await coordinator.async_stop()
+        raise
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
@@ -144,7 +164,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             coordinator.platforms.append(platform)
             await hass.config_entries.async_forward_entry_setups(entry, [platform])
 
-    entry.add_update_listener(async_reload_entry)
+    # Wrapped, because unloading does not clear an entry's update listeners.
+    # A plain add_update_listener leaves one behind on every reload, and then a
+    # single options change fires as many reloads as the entry has ever had --
+    # against an NVR, exactly the burst that wedges it.
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
     entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, coordinator.async_stop)
@@ -324,7 +348,10 @@ def _acquire_connector(address: str) -> TCPConnector:
     address = normalize_address(address)
     holder = _HOST_CONNECTORS.get(address)
     if holder is None or holder[0].closed:
-        holder = [TCPConnector(enable_cleanup_closed=True, ssl=SSL_CONTEXT), 0]
+        # enable_cleanup_closed is deliberately not set: aiohttp ignores it on
+        # every Python that Home Assistant now runs on, and warns once per
+        # connector in the user's log for the trouble.
+        holder = [TCPConnector(ssl=SSL_CONTEXT), 0]
         _HOST_CONNECTORS[address] = holder
     holder[1] += 1
     return holder[0]
@@ -339,6 +366,7 @@ async def _release_connector(address: str) -> None:
     holder[1] -= 1
     if holder[1] <= 0:
         _HOST_CONNECTORS.pop(address, None)
+        clear_host_cache(address)
         await holder[0].close()
 
 
@@ -360,6 +388,8 @@ class DahuaHostEventStream:
         self._owner = None  # whose client the stream currently borrows
         self._events: frozenset = frozenset()
         self._task: asyncio.Task | None = None
+        # Whether the last attach failed, so an outage is reported once.
+        self._failing = False
 
     @property
     def coordinators(self) -> list:
@@ -436,16 +466,28 @@ class DahuaHostEventStream:
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
+                self._failing = False
                 _LOGGER.debug("Recycling event stream for %s", self._address)
             except Exception as ex:  # pylint: disable=broad-except
-                _LOGGER.warning(
-                    "Event stream for %s ended unexpectedly: %s", self._address, ex
-                )
+                # Say it once per outage, not once per retry. Silence was the
+                # old behaviour and it is why these failures went unreported;
+                # a warning every sixty seconds forever is the other extreme.
+                if not self._failing:
+                    self._failing = True
+                    _LOGGER.warning(
+                        "Event stream for %s ended unexpectedly: %s", self._address, ex
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Event stream for %s still failing: %s", self._address, ex
+                    )
+            else:
+                self._failing = False
 
-            if time.monotonic() - start_time < 10:
-                retry_in = jittered(EVENT_STREAM_RETRY_SECONDS)
+            retry_in = event_stream_retry_delay(time.monotonic() - start_time)
+            if retry_in:
                 _LOGGER.debug(
-                    "Event stream for %s failed quickly, retrying in %.0fs",
+                    "Reconnecting to event stream for %s in %.0fs",
                     self._address,
                     retry_in,
                 )
@@ -739,12 +781,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
                 self._supports_floodlightmode = self.supports_floodlightmode()
 
-                try:
-                    await self.client.async_get_config_lighting(self._channel, self._profile_mode)
-                    self._supports_lighting = True
-                except ClientError:
-                    self._supports_lighting = False
-                    pass
+                self._supports_lighting = await self.async_detect_lighting_support()
                 _LOGGER.debug("Device supports infrared lighting=%s", self.supports_infrared_light())
 
 #Checking lighting_v2 support
@@ -1129,11 +1166,21 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         return self.data.get("table.DisableEventNotify.Enable", "").lower() == "false"
 
     def is_smart_motion_detection_enabled(self) -> bool:
-        """ Returns true if smart motion detection is enabled """
+        """ Returns true if smart motion detection is enabled
+
+        SmartMotionDetect is a host-wide read that returns a row per channel,
+        and the rows are sparse: a device only reports the channels the option
+        is configured on. Reading row 0 for every channel reported one camera's
+        setting for all of them, and reported false for the whole NVR when
+        there is no row 0 at all.
+        """
         if self.supports_smart_motion_detection_amcrest():
             return self.data.get("table.VideoAnalyseRule[0][0].Enable", "").lower() == "true"
-        else:
-            return self.data.get("table.SmartMotionDetect[0].Enable", "").lower() == "true"
+        value = self.data.get("table.SmartMotionDetect[{0}].Enable".format(self._channel))
+        if value is None:
+            # A single camera reports one row, and that row is row 0.
+            value = self.data.get("table.SmartMotionDetect[0].Enable", "")
+        return value.lower() == "true"
 
     def is_siren_on(self) -> bool:
         """ Returns true if the camera siren is on """
@@ -1225,6 +1272,21 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         if mode is None:
             mode = mode_data.get("table.VideoInMode[0].Config[0]", "0")
         return mode or "0"
+
+    async def async_detect_lighting_support(self) -> bool:
+        """Does this channel have an infrared light?
+
+        Judged by what comes back, not by an exception. async_get_config
+        catches aiohttp.ClientResponseError and returns {}, so an
+        exception-only probe could never fail: every device was marked as
+        having an IR light and then fetched Lighting[channel][mode] on every
+        poll, forever. The profile mode probe reads its result the same way.
+        """
+        try:
+            conf = await self.client.async_get_config_lighting(self._channel, self._profile_mode)
+        except ClientError:
+            return False
+        return len(conf) > 0
 
     def get_profile_mode(self) -> str:
         # profile_mode 0=day, 1=night, 2=scene
