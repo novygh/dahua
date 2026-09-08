@@ -1,7 +1,7 @@
 """Switch platform for dahua."""
-from aiohttp import ClientError
 from homeassistant.core import HomeAssistant
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.const import EntityCategory
 from custom_components.dahua import DahuaDataUpdateCoordinator
 
 from .const import DOMAIN, DISARMING_ICON, MOTION_DETECTION_ICON, SIREN_ICON, BELL_ICON
@@ -24,18 +24,25 @@ async def async_setup_entry(hass: HomeAssistant, entry, async_add_devices):
     if coordinator.supports_smart_motion_detection() or coordinator.supports_smart_motion_detection_amcrest():
         devices.append(DahuaSmartMotionDetectionBinarySwitch(coordinator, entry))
 
-    try:
-        await coordinator.client.async_get_disarming_linkage()
+    # The coordinator already asked the device this during setup and kept the
+    # answer. Asking again here put a network round trip inside platform setup,
+    # where a device that is slow to answer eats the entry's setup budget.
+    if coordinator.supports_disarming_linkage():
         devices.append(DahuaDisarmingLinkageBinarySwitch(coordinator, entry))
         devices.append(DahuaDisarmingEventNotificationsLinkageBinarySwitch(coordinator, entry))
-    except ClientError as exception:
-        pass
 
     async_add_devices(devices)
 
 
 class DahuaMotionDetectionBinarySwitch(DahuaBaseEntity, SwitchEntity):
     """dahua motion detection switch class. Used to enable or disable motion detection"""
+
+    # Configuration, not a control: this changes how the camera behaves rather
+    # than doing something now, so it belongs in the device page's configuration
+    # section and out of auto-generated dashboards. The siren is deliberately
+    # left alone -- that one is an action someone wants on a dashboard.
+    _attr_entity_category = EntityCategory.CONFIG
+
 
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on/enable motion detection."""
@@ -79,6 +86,9 @@ class DahuaMotionDetectionBinarySwitch(DahuaBaseEntity, SwitchEntity):
 class DahuaDisarmingLinkageBinarySwitch(DahuaBaseEntity, SwitchEntity):
     """will set the camera's disarming linkage (Event -> Disarming in the UI)"""
 
+    _attr_entity_category = EntityCategory.CONFIG
+
+
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on/enable linkage"""
         channel = self._coordinator.get_channel()
@@ -121,6 +131,9 @@ class DahuaDisarmingLinkageBinarySwitch(DahuaBaseEntity, SwitchEntity):
 class DahuaDisarmingEventNotificationsLinkageBinarySwitch(DahuaBaseEntity, SwitchEntity):
     """will set the camera's event notifications when device is disarmed (Event -> Disarming -> Event Notifications in the UI)"""
 
+    _attr_entity_category = EntityCategory.CONFIG
+
+
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on/enable event notifications"""
         channel = self._coordinator.get_channel()
@@ -161,6 +174,9 @@ class DahuaDisarmingEventNotificationsLinkageBinarySwitch(DahuaBaseEntity, Switc
 
 class DahuaSmartMotionDetectionBinarySwitch(DahuaBaseEntity, SwitchEntity):
     """Enables or disables the Smart Motion Detection option in the camera"""
+
+    _attr_entity_category = EntityCategory.CONFIG
+
 
     async def async_turn_on(self, **kwargs):  # pylint: disable=unused-argument
         """Turn on SmartMotionDetect"""
