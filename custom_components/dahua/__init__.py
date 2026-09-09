@@ -45,6 +45,7 @@ from .const import (
     CONF_AUTO_DETECT_CHANNEL,
     CONF_USE_HTTPS,
     CONF_SCAN_INTERVAL,
+    CONF_NVR_ACTIVE_DETERRENCE,
     DEFAULT_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
 )
@@ -77,6 +78,20 @@ EVENT_STREAM_SHORT_RETRY_SECONDS = 10
 # device that ran out of connections stays out of connections, because each
 # attempt costs it another one. Back off instead, to this ceiling.
 EVENT_STREAM_MAX_RETRY_SECONDS = 600
+
+
+# A capability probe that times out has told us what an errored probe tells us:
+# this device will not serve that call, so do not offer the entity. Timeouts are
+# not aiohttp.ClientError -- asyncio.TimeoutError is the builtin -- so before
+# this they escaped the probe, hit the outer handler, and failed the whole
+# config entry with ConfigEntryNotReady. One slow capability check took the
+# device down and Home Assistant retried it forever. See #594 and #631.
+PROBE_FAILED = (ClientError, TimeoutError)
+
+# The coaxial probe deliberately only treats an HTTP error response as "not
+# supported"; a connection failure there should still fail setup. Timeouts join
+# it for the reason above, without widening the rest.
+PROBE_REFUSED = (ClientResponseError, TimeoutError)
 
 
 def event_stream_retry_delay(lived_seconds: float, consecutive_failures: int = 0) -> float:
@@ -623,6 +638,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self.connected = None
         self.events: list = events
         self._supports_coaxial_control = False
+        self._nvr_active_deterrence = entry.options.get(CONF_NVR_ACTIVE_DETERRENCE, False)
         self._supports_disarming_linkage = False
         self._supports_event_notifications = False
         self._supports_smart_motion_detection = False
@@ -831,28 +847,29 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                         # but check if unit is not a doorbell first as channel 0 doesnt exist for VTOs
                         if not self.is_doorbell():
                             self._channel_number = self._channel
-                    except ClientError:
+                    except PROBE_FAILED:
                         pass
                 _LOGGER.debug("Using channel number %s (auto_detect=%s)", self._channel_number, auto_detect)
 
                 try:
-                    await self.client.async_get_coaxial_control_io_status()
+                    coaxial_channel = self._channel_number if self.is_nvr_channel() else 1
+                    await self.client.async_get_coaxial_control_io_status(coaxial_channel)
                     self._supports_coaxial_control = True
-                except ClientResponseError:
+                except PROBE_REFUSED:
                     self._supports_coaxial_control = False
                 _LOGGER.debug("Device supports Coaxial Control=%s", self._supports_coaxial_control)
 
                 try:
                     await self.client.async_get_disarming_linkage()
                     self._supports_disarming_linkage = True
-                except ClientError:
+                except PROBE_FAILED:
                     self._supports_disarming_linkage = False
                 _LOGGER.debug("Device supports disarming linkage=%s", self._supports_disarming_linkage)
 
                 try:
                     await self.client.async_get_event_notifications()
                     self._supports_event_notifications = True
-                except ClientError:
+                except PROBE_FAILED:
                     self._supports_event_notifications = False
                 _LOGGER.debug("Device supports event notifications=%s", self._supports_event_notifications)
 
@@ -865,7 +882,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     try:
                         await self.client.async_get_ptz_position()
                         self._supports_ptz_position = True
-                    except ClientError:
+                    except PROBE_FAILED:
                         self._supports_ptz_position = False
                 _LOGGER.debug("Device supports PTZ position=%s", self._supports_ptz_position)
 
@@ -874,7 +891,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.client.async_get_smart_motion_detection()
                     self._supports_smart_motion_detection = True
-                except ClientError:
+                except PROBE_FAILED:
                     self._supports_smart_motion_detection = False
                 _LOGGER.debug("Device supports smart motion detection=%s", self._supports_smart_motion_detection)
 
@@ -893,7 +910,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     await self.client.async_get_lighting_v2()
                     self._supports_lighting_v2 = True
-                except ClientError:
+                except PROBE_FAILED:
                     self._supports_lighting_v2 = False
                     pass
                 _LOGGER.debug("Device supports Lighting_V2=%s", self._supports_lighting_v2)
@@ -910,7 +927,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                         # Error: Error -1 getting param in name=Lighting[0][1]
                         # Otherwise we'll get multiple lines of config back
                         self._supports_profile_mode = len(conf) > 1
-                    except ClientError:
+                    except PROBE_FAILED:
                         _LOGGER.debug("Cam does not support profile mode. Will use mode 0")
                         self._supports_profile_mode = False
                     _LOGGER.debug("Device supports profile mode=%s", self._supports_profile_mode)
@@ -979,7 +996,12 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 coros.append(asyncio.ensure_future(self.client.async_get_event_notifications()))
             # The siren switch and the security light both read this one.
             if self._supports_coaxial_control and self._wanted_by(LIGHT, SWITCH):
-                coros.append(asyncio.ensure_future(self.client.async_get_coaxial_control_io_status()))
+                coaxial_channel = self._channel_number if self.is_nvr_channel() else 1
+                coros.append(
+                    asyncio.ensure_future(
+                        self.client.async_get_coaxial_control_io_status(coaxial_channel)
+                    )
+                )
             if self._supports_smart_motion_detection and self._wanted_by(SWITCH):
                 coros.append(asyncio.ensure_future(self.client.async_get_smart_motion_detection()))
             if self.supports_smart_motion_detection_amcrest() and self._wanted_by(SWITCH):
@@ -1217,6 +1239,10 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         m = self.model.upper()
         return "-AS-PV" in m or "L46N" in m or m.startswith("W452ASD")
 
+    def supports_nvr_active_deterrence(self) -> bool:
+        """Return whether NVR active-deterrence entities were explicitly enabled."""
+        return self._nvr_active_deterrence
+
     def supports_security_light(self) -> bool:
         """
         Returns true if this camera has the red/blue flashing security light feature.  For example, the
@@ -1398,18 +1424,47 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     def read_profile_mode(self, mode_data: dict) -> str:
         """Picks this channel's day/night profile out of the VideoInMode table.
 
-        The read is host-wide -- getConfig&name=VideoInMode returns a row per
-        channel -- so an NVR channel has to take its own row. Reading row 0 for
-        every channel gave the whole device channel 1's day/night profile, and
-        that profile is then what selects which Lighting[channel][profile] the
-        IR light is read from and written to.
+        The profile chooses which Lighting[channel][profile] the light is read
+        from and written to, so getting it wrong means commands are accepted and
+        nothing lights up.
 
-        Falls back to row 0, which is all a single-channel camera returns.
+        Three device behaviours have to coexist here, and two of them disagree
+        about which field is authoritative:
+
+        - **General profile management** (`Config[0]` = 2). One profile covers
+          all conditions and it is profile 2. `ConfigEx` is still present and
+          still echoes day/night, but it selects nothing -- preferring it sent
+          every write to the day profile while the camera rendered from 2 (#605).
+        - **IL series dual smart light.** The profile is chosen by the `ConfigEx`
+          string; `Config[0]` stays a static 0 whichever profile is live, so
+          reading it left the illuminator permanently tracking day (#582).
+        - **Everything else.** `Config[0]` is the profile.
+
+        The read is host-wide -- getConfig&name=VideoInMode returns a row per
+        channel -- so an NVR channel has to take its own row, falling back to
+        row 0, which is all a single-channel camera returns.
         """
-        mode = mode_data.get("table.VideoInMode[{0}].Config[0]".format(self._channel))
-        if mode is None:
-            mode = mode_data.get("table.VideoInMode[0].Config[0]", "0")
-        return mode or "0"
+        def field(name):
+            value = mode_data.get("table.VideoInMode[{0}].{1}".format(self._channel, name))
+            if value is None:
+                value = mode_data.get("table.VideoInMode[0].{0}".format(name))
+            return value
+
+        config = field("Config[0]")
+        config_ex = field("ConfigEx")
+
+        if config == "2":
+            return "2"
+        if config_ex is not None:
+            # Only act on a value we recognise. Treating anything else as day
+            # would override a Config[0] that is very likely right, for a
+            # string we do not understand.
+            named = str(config_ex).strip().lower()
+            if named == "night":
+                return "1"
+            if named == "day":
+                return "0"
+        return config or "0"
 
     async def async_detect_lighting_support(self) -> bool:
         """Does this channel have an infrared light?
@@ -1422,7 +1477,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         try:
             conf = await self.client.async_get_config_lighting(self._channel, self._profile_mode)
-        except ClientError:
+        except PROBE_FAILED:
             return False
         return len(conf) > 0
 
@@ -1433,6 +1488,10 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     def get_channel(self) -> int:
         """returns the channel index of this camera. 0 based. Channel index 0 is channel number 1"""
         return self._channel
+
+    def is_nvr_channel(self) -> bool:
+        """Return whether this entry represents a camera channel on an NVR."""
+        return self._channel > 0 or "NVR" in self.model.upper()
 
     def get_channel_number(self) -> int:
         """returns the channel number of this camera"""
@@ -1485,7 +1544,13 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Handle removal of an entry."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is None:
+        # Setup may have failed before the coordinator was registered, or a
+        # previous unload may already have removed it. Treat that as unloaded
+        # so an options-triggered reload can continue cleanly.
+        return True
+
     await coordinator.async_stop()
     unloaded = all(
         await asyncio.gather(
@@ -1514,5 +1579,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload config entry."""
-    await async_unload_entry(hass, entry)
-    await async_setup_entry(hass, entry)
+    await hass.config_entries.async_reload(entry.entry_id)
