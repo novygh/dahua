@@ -67,7 +67,7 @@ jobs:
               path.write_text(text)
           PY
 
-      - name: Verify fork differs only by the intended VTO patch
+      - name: Verify only known fork differences remain
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -100,6 +100,14 @@ jobs:
               '        if coordinator.is_doorbell():\n'
               '            self._stream_source += "#backchannel=0"\n'
           )
+          legacy_comment = (
+              '        # "async_set_infrared_mode" is the method called upon calling '
+              'the service. Defined below in the DahuaCamera class\n'
+          )
+          upstream_comment = (
+              '        # "async_set_infrared_mode" is the method called upon calling '
+              'the service. Defined below in DahuaCamera class\n'
+          )
 
           local = Path(camera).read_text()
           if local.count(patch) != 1:
@@ -112,13 +120,22 @@ jobs:
               text=True,
           )
 
-          without_patch = local.replace(patch, "", 1)
-          if without_patch != upstream:
+          normalized = local.replace(patch, "", 1)
+
+          # One harmless comment edit predates the automated sync. Permit only
+          # that exact historical delta, and only while upstream still has the
+          # original wording. Any other camera.py change stops the workflow.
+          if legacy_comment in normalized and upstream_comment in upstream:
+              if normalized.count(legacy_comment) != 1:
+                  raise SystemExit("Unexpected duplicate legacy comment delta")
+              normalized = normalized.replace(legacy_comment, upstream_comment, 1)
+
+          if normalized != upstream:
               raise SystemExit(
-                  "camera.py differs from upstream by more than the intended VTO patch"
+                  "camera.py differs from upstream by more than the known VTO patch/comment delta"
               )
 
-          print("OK: fork contains exactly one intentional camera.py difference")
+          print("OK: only the known, explicitly validated fork differences remain")
           PY
 
       - name: Sanity-check Python sources
