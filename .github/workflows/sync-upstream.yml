@@ -241,7 +241,7 @@ jobs:
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
           UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $RELEASE_TAG already exists; nothing to publish."
             exit 0
           fi
@@ -259,6 +259,7 @@ jobs:
           EOF
 
           gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --target main \
             --title "$RELEASE_TAG" \
             --notes-file /tmp/release-notes.md
