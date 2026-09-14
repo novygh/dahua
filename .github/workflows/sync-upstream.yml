@@ -67,12 +67,76 @@ jobs:
               path.write_text(text)
           PY
 
+      - name: Verify fork differs only by the intended VTO patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          workflow = ".github/workflows/sync-upstream.yml"
+          camera = "custom_components/dahua/camera.py"
+          allowed = {workflow, camera}
+
+          changed = set(
+              subprocess.check_output(
+                  ["git", "diff", "--name-only", "upstream/main", "--"],
+                  text=True,
+              ).splitlines()
+          )
+
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit(
+                  "Unexpected fork differences after upstream merge: "
+                  + ", ".join(sorted(unexpected))
+              )
+
+          if camera not in changed:
+              raise SystemExit(
+                  "VTO patch is no longer a fork-only difference; refusing automatic push"
+              )
+
+          patch = (
+              '        if coordinator.is_doorbell():\n'
+              '            self._stream_source += "#backchannel=0"\n'
+          )
+
+          local = Path(camera).read_text()
+          if local.count(patch) != 1:
+              raise SystemExit(
+                  "Expected exactly one VTO backchannel patch in camera.py"
+              )
+
+          upstream = subprocess.check_output(
+              ["git", "show", f"upstream/main:{camera}"],
+              text=True,
+          )
+
+          without_patch = local.replace(patch, "", 1)
+          if without_patch != upstream:
+              raise SystemExit(
+                  "camera.py differs from upstream by more than the intended VTO patch"
+              )
+
+          print("OK: fork contains exactly one intentional camera.py difference")
+          PY
+
+      - name: Sanity-check Python sources
+        run: |
+          git diff --check upstream/main --
+          python -m compileall -q custom_components/dahua
+
       - name: Commit preserved patch if needed
         run: |
           git add custom_components/dahua/camera.py
           if ! git diff --cached --quiet; then
             git commit -m "Preserve VTO backchannel patch after upstream sync"
           fi
+
+      - name: Final guard before push
+        run: |
+          test "$(git grep -F '#backchannel=0' -- custom_components/dahua/camera.py | wc -l)" -eq 1
+          git diff --quiet
 
       - name: Push fork
         run: |
