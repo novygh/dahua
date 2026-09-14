@@ -1,9 +1,19 @@
-name: Sync upstream and preserve VTO patch
+name: Sync upstream and publish VTO no-backchannel fork
 
 on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+    inputs:
+      revision:
+        description: "Optional fork revision, e.g. 2 creates -r2 for the current upstream version"
+        required: false
+        default: ""
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/sync-upstream.yml"
 
 permissions:
   contents: write
@@ -31,9 +41,49 @@ jobs:
       - name: Merge upstream
         run: |
           # The fork intentionally carries a tiny VTO-only change in camera.py.
-          # Upstream also edits this area, so let upstream win conflicting hunks;
-          # the VTO patch is reapplied in the next step.
+          # Let upstream win conflicting hunks; the VTO patch is reapplied below.
           git merge upstream/main --no-edit -X theirs
+
+      - name: Determine fork release version
+        id: version
+        env:
+          FORK_REVISION: ${{ github.event.inputs.revision || '' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          manifest_path = Path("custom_components/dahua/manifest.json")
+          upstream_manifest = json.loads(
+              subprocess.check_output(
+                  ["git", "show", "upstream/main:custom_components/dahua/manifest.json"],
+                  text=True,
+              )
+          )
+          upstream_version = upstream_manifest["version"]
+
+          revision = os.environ.get("FORK_REVISION", "").strip()
+          if revision:
+              if not revision.isdigit() or int(revision) < 2:
+                  raise SystemExit("revision must be an integer >= 2, for example 2")
+              release_tag = f"{upstream_version}-vto-no-backchannel-r{revision}"
+          else:
+              release_tag = f"{upstream_version}-vto-no-backchannel"
+
+          local_manifest = json.loads(manifest_path.read_text())
+          local_manifest["version"] = release_tag
+          manifest_path.write_text(json.dumps(local_manifest, indent=2) + "\n")
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a") as f:
+              f.write(f"upstream_version={upstream_version}\n")
+              f.write(f"release_tag={release_tag}\n")
+
+          print(f"Upstream version: {upstream_version}")
+          print(f"Fork release: {release_tag}")
+          PY
 
       - name: Ensure VTO backchannel patch is present
         run: |
@@ -44,7 +94,12 @@ jobs:
           path = Path("custom_components/dahua/camera.py")
           text = path.read_text()
 
-          if "#backchannel=0" not in text:
+          patch = (
+              '        if coordinator.is_doorbell():\n'
+              '            self._stream_source += "#backchannel=0"\n'
+          )
+
+          if patch not in text:
               # Match the RTSP stream-source assignment even if upstream reformats
               # the get_rtsp_stream_url() call across multiple lines.
               pattern = re.compile(
@@ -58,24 +113,24 @@ jobs:
                       "RTSP stream-source assignment changed upstream; refusing to patch automatically"
                   )
 
-              patched_block = (
-                  match.group(0)
-                  + "        if coordinator.is_doorbell():\n"
-                  + "            self._stream_source += \"#backchannel=0\"\n"
-              )
-              text = text[:match.start()] + patched_block + text[match.end():]
+              text = text[:match.end()] + patch + text[match.end():]
               path.write_text(text)
           PY
 
       - name: Verify only known fork differences remain
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
         run: |
           python - <<'PY'
           from pathlib import Path
+          import json
+          import os
           import subprocess
 
           workflow = ".github/workflows/sync-upstream.yml"
           camera = "custom_components/dahua/camera.py"
-          allowed = {workflow, camera}
+          manifest = "custom_components/dahua/manifest.json"
+          allowed = {workflow, camera, manifest}
 
           changed = set(
               subprocess.check_output(
@@ -109,33 +164,49 @@ jobs:
               'the service. Defined below in DahuaCamera class\n'
           )
 
-          local = Path(camera).read_text()
-          if local.count(patch) != 1:
-              raise SystemExit(
-                  "Expected exactly one VTO backchannel patch in camera.py"
-              )
+          local_camera = Path(camera).read_text()
+          if local_camera.count(patch) != 1:
+              raise SystemExit("Expected exactly one VTO backchannel patch in camera.py")
 
-          upstream = subprocess.check_output(
+          upstream_camera = subprocess.check_output(
               ["git", "show", f"upstream/main:{camera}"],
               text=True,
           )
-
-          normalized = local.replace(patch, "", 1)
+          normalized_camera = local_camera.replace(patch, "", 1)
 
           # One harmless comment edit predates the automated sync. Permit only
-          # that exact historical delta, and only while upstream still has the
-          # original wording. Any other camera.py change stops the workflow.
-          if legacy_comment in normalized and upstream_comment in upstream:
-              if normalized.count(legacy_comment) != 1:
+          # that exact historical delta while upstream still has the old wording.
+          if legacy_comment in normalized_camera and upstream_comment in upstream_camera:
+              if normalized_camera.count(legacy_comment) != 1:
                   raise SystemExit("Unexpected duplicate legacy comment delta")
-              normalized = normalized.replace(legacy_comment, upstream_comment, 1)
+              normalized_camera = normalized_camera.replace(
+                  legacy_comment, upstream_comment, 1
+              )
 
-          if normalized != upstream:
+          if normalized_camera != upstream_camera:
               raise SystemExit(
                   "camera.py differs from upstream by more than the known VTO patch/comment delta"
               )
 
-          print("OK: only the known, explicitly validated fork differences remain")
+          local_manifest = json.loads(Path(manifest).read_text())
+          upstream_manifest = json.loads(
+              subprocess.check_output(
+                  ["git", "show", f"upstream/main:{manifest}"],
+                  text=True,
+              )
+          )
+          expected_tag = os.environ["RELEASE_TAG"]
+          if local_manifest.get("version") != expected_tag:
+              raise SystemExit("manifest.json version does not match the fork release tag")
+
+          normalized_manifest = dict(local_manifest)
+          normalized_manifest["version"] = upstream_manifest.get("version")
+          if normalized_manifest != upstream_manifest:
+              raise SystemExit(
+                  "manifest.json differs from upstream by more than the fork version string"
+              )
+
+          print("OK: only explicitly validated fork differences remain")
           PY
 
       - name: Sanity-check Python sources
@@ -143,18 +214,51 @@ jobs:
           git diff --check upstream/main --
           python -m compileall -q custom_components/dahua
 
-      - name: Commit preserved patch if needed
+      - name: Commit fork patch and version
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
         run: |
-          git add custom_components/dahua/camera.py
+          git add custom_components/dahua/camera.py custom_components/dahua/manifest.json
           if ! git diff --cached --quiet; then
-            git commit -m "Preserve VTO backchannel patch after upstream sync"
+            git commit -m "Prepare ${RELEASE_TAG}"
           fi
 
       - name: Final guard before push
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
         run: |
           test "$(git grep -F '#backchannel=0' -- custom_components/dahua/camera.py | wc -l)" -eq 1
+          test "$(python -c 'import json; print(json.load(open("custom_components/dahua/manifest.json"))["version"])')" = "$RELEASE_TAG"
           git diff --quiet
 
       - name: Push fork
         run: |
           git push origin main
+
+      - name: Publish GitHub release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          UPSTREAM_VERSION: ${{ steps.version.outputs.upstream_version }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; nothing to publish."
+            exit 0
+          fi
+
+          cat > /tmp/release-notes.md <<EOF
+          Based on upstream rroller/dahua ${UPSTREAM_VERSION}.
+
+          Fork-specific change:
+          - Dahua VTO / doorbell RTSP sources append \`#backchannel=0\`.
+          - This prevents Home Assistant/go2rtc from opening the RTSP talkback backchannel and interfering with DMSS two-way audio.
+          - Video and incoming audio from the VTO remain available in Home Assistant.
+
+          Upstream project: https://github.com/rroller/dahua
+          Related issue: https://github.com/rroller/dahua/issues/595
+          EOF
+
+          gh release create "$RELEASE_TAG" \
+            --target main \
+            --title "$RELEASE_TAG" \
+            --notes-file /tmp/release-notes.md
