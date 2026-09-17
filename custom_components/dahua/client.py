@@ -31,6 +31,24 @@ MAX_CONCURRENT_REQUESTS_PER_HOST = 2
 _HOST_LIMITS: dict = {}
 
 
+def _device_key(address: str, port) -> str:
+    """One device.
+
+    Two Dahua boxes can sit behind one IP on different ports -- a bridge
+    forwarding 80/554 to one and 81/555 to another. Everything that identifies a
+    device, rather than the network path to it, has to say which one.
+
+    The port is normalised because a config entry stores it as a string while
+    callers pass an int, and "192.168.0.175:80" must not be a different device
+    from "192.168.0.175:80".
+    """
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        pass
+    return "{0}:{1}".format(address, port)
+
+
 def _host_limiter(address: str) -> asyncio.Semaphore:
     """Returns the semaphore shared by every client talking to this address."""
     limiter = _HOST_LIMITS.get(address)
@@ -163,17 +181,40 @@ async def _release_rpc2(key) -> None:
         await holder.session.close()
 
 
-def _digest_state(address: str, username: str) -> dict:
-    """The digest state shared by every client for this host and user.
+def _digest_state(device: str, username: str) -> dict:
+    """The digest state shared by every client for this device and user.
 
-    Keyed by user as well as host because the response digest is built from the
-    credentials, and entries for one NVR need not share them.
+    Keyed by user as well as device because the response digest is built from
+    the credentials, and entries for one NVR need not share them. Keyed by
+    device rather than address because a nonce is issued by one box and means
+    nothing to another that happens to answer on the same IP.
     """
-    key = (address, username)
+    key = (device, username)
     state = _HOST_DIGEST_STATE.get(key)
     if state is None:
         state = _HOST_DIGEST_STATE[key] = {}
     return state
+
+
+def _overlay_text(*parts: str) -> str:
+    """Join the lines of a title or overlay, each one safe to put in a URL.
+
+    The pipe is Dahua's line separator and has to arrive as a pipe, so the parts
+    are escaped and the separator is not.
+
+    Escaping them matters more than it looks. The text went into the URL raw,
+    and yarl then encodes the query on the way out -- a space becomes "+", which
+    this firmware stores literally. Measured on a DHI-NVR5464-16P-EI:
+
+        ChannelTitle[14].Name=Channel+1    -> stored as "Channel+1"
+        ChannelTitle[14].Name=Channel%201  -> stored as "Channel 1"
+
+    So every camera name with a space in it was being written back wrong, and
+    the device answers OK either way. A "#" is quieter still: yarl reads the
+    rest of the value as a URL fragment and the request line never carries it,
+    so "Gate#2" arrives as "Gate".
+    """
+    return "|".join(quote(part, safe="") for part in parts if part)
 
 
 # Most of what a coordinator reads every poll carries no channel argument:
@@ -229,13 +270,18 @@ def _is_read(url: str) -> bool:
     return READ_ACTION_PREFIX in url
 
 
-def clear_host_cache(address: str) -> None:
-    """Drop every shared read for this host.
+def clear_host_cache(scope: str) -> None:
+    """Drop the shared reads for one device, or for every device at an address.
 
-    Called on every write, since a write is the reason a value the device
-    reports would change, and when the last entry for the host goes away.
+    `scope` is either a device key ("10.0.0.1:80") or a bare address
+    ("10.0.0.1"), which matches every device behind it. A write is only a reason
+    to distrust what *that* device said, so the write path passes its own key;
+    the connector teardown has only the address, and dropping everything behind
+    it is right there because the connector is going too.
     """
-    for key in [k for k in _HOST_CACHE if k[0] == address]:
+    stale = [k for k in _HOST_CACHE
+             if k[0] == scope or k[0].startswith(scope + ":")]
+    for key in stale:
         del _HOST_CACHE[key]
 
 
@@ -426,12 +472,14 @@ class DahuaClient:
         self._password = password
         # Strip trailing slashes from address to prevent malformed URLs like http://host/:80
         self._address = address.rstrip('/')
-        # One digest challenge shared by every request to this host, so a call
+        self._port = port
+        # Which device this is, as opposed to which address answers for it.
+        self._device = _device_key(self._address, port)
+        # One digest challenge shared by every request to this device, so a call
         # doesn't have to take a 401 before it can authenticate -- and neither
         # does the next config entry for the same NVR.
-        self._digest_state = _digest_state(self._address, username)
+        self._digest_state = _digest_state(self._device, username)
         self._session = session
-        self._port = port
         self._rtsp_port = rtsp_port
 
         # Callers that do not say keep the old behaviour: HTTPS only on 443.
@@ -772,7 +820,7 @@ class DahuaClient:
         return sorted(preset_ids)
 
     def _rpc2_key(self):
-        return (self._address, self._username)
+        return (self._device, self._username)
 
     async def _shared_rpc2(self) -> "_SharedRpc2Session":
         """This host's RPC2 session, logged in on first use.
@@ -886,7 +934,7 @@ class DahuaClient:
                 scheme_params.get("table"), lighting_params.get("table"), channel,
                 profile, light_index, enabled, brightness, restore_mode,
             )
-            clear_host_cache(self._address)
+            clear_host_cache(self._device)
             response = await holder.client.set_configs([
                 ("LightingScheme", scheme),
                 ("Lighting_V2", lighting),
@@ -1154,7 +1202,7 @@ class DahuaClient:
 
     async def async_set_service_set_channel_title(self, channel: int, text1: str, text2: str):
         """ async_set_service_set_channel_title sets the channel title """
-        text = '|'.join(filter(None, [text1, text2]))
+        text = _overlay_text(text1, text2)
         url = "/cgi-bin/configManager.cgi?action=setConfig&ChannelTitle[{0}].Name={1}".format(
             channel, text
         )
@@ -1165,7 +1213,7 @@ class DahuaClient:
     async def async_set_service_set_text_overlay(self, channel: int, group: int, text1: str, text2: str, text3: str,
                                                  text4: str):
         """ async_set_service_set_text_overlay sets the video text overlay """
-        text = '|'.join(filter(None, [text1, text2, text3, text4]))
+        text = _overlay_text(text1, text2, text3, text4)
         url = "/cgi-bin/configManager.cgi?action=setConfig&VideoWidget[{0}].CustomTitle[{1}].Text={2}".format(
             channel, group, text
         )
@@ -1175,7 +1223,7 @@ class DahuaClient:
 
     async def async_set_service_set_custom_overlay(self, channel: int, group: int, text1: str, text2: str):
         """ async_set_service_set_custom_overlay sets the customer overlay on the video"""
-        text = '|'.join(filter(None, [text1, text2]))
+        text = _overlay_text(text1, text2)
         url = "/cgi-bin/configManager.cgi?action=setConfig&VideoWidget[{0}].UserDefinedTitle[{1}].Text={2}".format(
             channel, group, text
         )
@@ -1567,19 +1615,22 @@ class DahuaClient:
                     response.close()
 
     async def get(self, url: str, verify_ok=False) -> dict:
-        """Get information from the API, sharing the read across this host.
+        """Get information from the API, sharing the read across this device.
 
         Two entries for one NVR asking the same question at the same moment get
         one round trip between them, and a repeat inside the TTL gets none.
+        Shared per device, not per address: two boxes behind one IP on different
+        ports are not each other, and answering one with the other's reply is
+        how their identities got swapped (#664).
         """
         if not _is_read(url):
-            clear_host_cache(self._address)
+            clear_host_cache(self._device)
             return await self._request(url, verify_ok)
 
-        # Credentials are part of the key: entries for one host may be
+        # Credentials are part of the key: entries for one device may be
         # configured with different users, and a successful read is not
         # otherwise scoped to who made it.
-        key = (self._address, self._username, url)
+        key = (self._device, self._username, url)
         now = time.monotonic()
         entry = _HOST_CACHE.get(key)
         if entry is None or not entry.is_usable(now):
