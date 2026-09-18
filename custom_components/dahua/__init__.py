@@ -852,6 +852,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self._supports_smart_motion_detection = False
         self._supports_ptz_position = False
         self._supports_lighting = False
+        self._supports_privacy_mode = False
         self._supports_floodlightmode = False
         self._serial_number: str
         self._profile_mode = "0"
@@ -1163,6 +1164,18 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                         self._supports_lighting_scheme_illuminator,
                     )
 
+                # Checking privacy mode (LeLensMask) support. This is RPC2 only and many models lack it.
+                # Deliberately broader than PROBE_FAILED: a camera without LeLensMask answers with an
+                # RPC2 result=false, which surfaces as ConnectionError, and a malformed table raises
+                # ValueError. Neither is a ClientError, so narrowing this would fail the whole entry.
+                try:
+                    await self.client.async_get_privacy_mode()
+                    self._supports_privacy_mode = True
+                except Exception as exception:
+                    self._supports_privacy_mode = False
+                    _LOGGER.debug("Privacy mode not available", exc_info=exception)
+                _LOGGER.debug("Device supports privacy mode=%s", self._supports_privacy_mode)
+
 
                 if not is_doorbell:
                     # Start the event listeners for IP cameras
@@ -1261,6 +1274,9 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             if (getattr(self, "_supports_lighting_scheme_illuminator", False)
                     and self._wanted_by(LIGHT)):
                 coros.append(asyncio.ensure_future(self.client.async_get_lighting_scheme()))
+            # Only the privacy mode switch reads this one.
+            if self._supports_privacy_mode and self._wanted_by(SWITCH):
+                coros.append(asyncio.ensure_future(self._async_fetch_privacy_mode()))
 
 
             # Gather results and update the data map
@@ -1662,12 +1678,14 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
         Both the capability check and the state read go through here so they
         cannot disagree about which row belongs to this channel.
+
+        There is no fallback to row 0. A single camera sits on channel 0, so the
+        lookup below already reads row 0 for it -- a fallback can only ever fire
+        on a channel that is not row 0's owner, and handing it that row reports
+        another camera's state and creates a switch whose writes the device
+        accepts and discards.
         """
-        value = self.data.get("table.SmartMotionDetect[{0}].Enable".format(self._channel))
-        if value is None:
-            # A single camera reports one row, and that row is row 0.
-            value = self.data.get("table.SmartMotionDetect[0].Enable")
-        return value
+        return self.data.get("table.SmartMotionDetect[{0}].Enable".format(self._channel))
 
     def is_smart_motion_detection_enabled(self) -> bool:
         """ Returns true if smart motion detection is enabled """
@@ -1877,14 +1895,22 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         - **Everything else.** `Config[0]` is the profile.
 
         The read is host-wide -- getConfig&name=VideoInMode returns a row per
-        channel -- so an NVR channel has to take its own row, falling back to
-        row 0, which is all a single-channel camera returns.
+        channel -- so an NVR channel takes its own row and no other. There is no
+        fallback to row 0: a single camera sits on channel 0, so the lookup
+        below already reads row 0 for it, and a fallback could therefore only
+        ever fire on a channel that is not row 0's owner. On a recorder that row
+        is camera 1, and adopting its profile decides which
+        Lighting_V2[channel][profile] every light command for this camera is
+        written to. Camera 1 on day and this one on night sends every write to a
+        profile the camera is not using, where it is accepted and ignored.
+
+        Worse, the fallback was per field, so Config[0] could come from this
+        channel while ConfigEx came from another -- one answer assembled from
+        two cameras.
         """
         def field(name):
-            value = mode_data.get("table.VideoInMode[{0}].{1}".format(self._channel, name))
-            if value is None:
-                value = mode_data.get("table.VideoInMode[0].{0}".format(name))
-            return value
+            return mode_data.get(
+                "table.VideoInMode[{0}].{1}".format(self._channel, name))
 
         config = field("Config[0]")
         config_ex = field("ConfigEx")
@@ -1964,6 +1990,23 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     def supports_smart_motion_detection_amcrest(self) -> bool:
         """ True if smart motion detection is supported for an amcrest device"""
         return self.model == "AD410" or self.model == "DB61i"
+
+    def supports_privacy_mode(self) -> bool:
+        """ True if the camera exposes the lens privacy mask over RPC2 """
+        return self._supports_privacy_mode
+
+    def is_privacy_mode_enabled(self) -> bool:
+        """ True if the lens privacy mask is currently enabled """
+        return self.data.get("privacy_mode_enabled", False)
+
+    async def _async_fetch_privacy_mode(self) -> dict:
+        """ Poll the privacy mode state, keeping the last known value on failure """
+        try:
+            return {"privacy_mode_enabled": await self.client.async_get_privacy_mode()}
+        except Exception as exception:
+            _LOGGER.debug("Failed to fetch privacy mode state", exc_info=exception)
+            previous = self.data.get("privacy_mode_enabled", False) if self.data else False
+            return {"privacy_mode_enabled": previous}
 
     def get_vto_client(self) -> DahuaVTOClient | None:
         """The doorbell's client, or None when there is not a live one.
