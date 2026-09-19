@@ -5,6 +5,7 @@ import asyncio
 from typing import Any, Dict
 import logging
 import random
+import re
 import ssl
 import time
 
@@ -227,6 +228,122 @@ def illuminator_brightness_bank(data: dict, channel: int, profile_mode, light_in
         if key in data:
             return bank
     return LIGHT_BRIGHTNESS_BANKS[0]
+
+
+SMART_MOTION_ROW = re.compile(r"^table\.SmartMotionDetect\[(\d+)\]")
+
+
+def smart_motion_row_indices(table) -> tuple:
+    """Which channel rows a device reports in its SmartMotionDetect table.
+
+    The presence of this channel's row is what decides whether it gets a smart
+    motion switch (#635), so when the answer surprises someone this is the fact
+    they need. Nothing logged it: the integration never logs a response body, so
+    #669 spent two rounds inferring the shape of a table that could simply have
+    been printed.
+
+    Returns a sorted tuple of the indices found, empty when the table is empty
+    or not a dict -- never raising, because a diagnostic that can take setup
+    down is worse than no diagnostic.
+    """
+    if not isinstance(table, dict):
+        return ()
+    found = set()
+    for key in table:
+        match = SMART_MOTION_ROW.match(str(key))
+        if match:
+            found.add(int(match.group(1)))
+    return tuple(sorted(found))
+
+
+def infrared_profile(data: dict, channel: int, profile_mode) -> str:
+    """Which Lighting profile this channel's infrared light is really using.
+
+    The v1 Lighting table is indexed [channel][profile], exactly as Lighting_V2
+    is, and the profiles genuinely differ. Measured on a DHI-NVR5464-16P-EI,
+    where five of fifteen channels report four profiles apiece and their modes
+    disagree:
+
+        table.Lighting[3][0].Mode=Auto
+        table.Lighting[3][1].Mode=ZoomPrio
+        table.Lighting[3][2].Mode=ZoomPrio
+        table.Lighting[3][3].Mode=ZoomPrio
+
+    The poll already fetches the *live* profile --
+    async_get_config_lighting(channel, self._profile_mode) -- while the reader
+    and the writer both hardcoded profile 0. On a camera running anything but
+    day that means the data holds one profile and the entity reads another, so
+    the light reports off whatever it is doing, and every write lands on a
+    profile the camera is not rendering from.
+
+    Falls back to profile 0 when the live one is not in what the device
+    returned, which is the single-profile case and also what keeps a channel
+    working if VideoInMode names a profile the Lighting table does not have.
+    Unlike the row 0 fallbacks removed in #679 and #683, this one stays inside
+    the same channel -- it can only ever return this camera's own row.
+    """
+    live = str(profile_mode)
+    if "table.Lighting[{0}][{1}].Mode".format(channel, live) in data:
+        return live
+    return "0"
+
+
+# VideoInOptions[channel].DayNightColor, as the device spells the Day/Night
+# setting. The names are the ones the existing set_video_in_day_night_mode
+# service already accepts, so the select and the service speak the same words.
+DAY_NIGHT_NAMES = {"0": "Color", "1": "Auto", "2": "BlackWhite"}
+
+
+def day_night_color_name(data: dict, channel: int):
+    """This channel's Day/Night mode by name, or None if it did not report one.
+
+    None rather than a default: a device that does not carry this setting must
+    not be shown as though it were in Color, and an unrecognised value is a
+    device telling us something this mapping does not cover.
+    """
+    value = data.get("table.VideoInOptions[{0}].DayNightColor".format(channel))
+    if value is None:
+        return None
+    return DAY_NIGHT_NAMES.get(str(value).strip())
+
+
+# DeviceType values that name a class of device rather than a model. Measured on
+# a DHI-NVR5464-16P-EI, which answers "IP Camera" and "IPC" for most channels and
+# a real model for one; the Lorex N843A8 on #669 answers a model for every
+# populated channel. Treating these as a model would be worse than having none.
+GENERIC_DEVICE_TYPES = {"", "ip camera", "ipc", "camera", "ip dome", "unknown"}
+
+
+def remote_device_model(data: dict, channel: int):
+    """The model of the camera on this NVR channel, or None if it did not say.
+
+    Every channel of a recorder reports the *recorder's* model, because that is
+    what magicBox.cgi getSystemInfo answers. The camera's own model is in
+    RemoteDevice, indexed by channel:
+
+        table.RemoteDevice.uuid:System_CONFIG_NETCAMERA_INFO_6.DeviceType=B451AJ
+
+    Both spellings are accepted: this uuid-keyed form, measured on a
+    DHI-NVR5464-16P-EI and on the Lorex N843A8 of #669, and the plain bracket
+    form in case firmware elsewhere uses it.
+
+    Returns None rather than a guess when the value names a class of device
+    instead of a model -- see GENERIC_DEVICE_TYPES. A caller that cannot tell
+    "no answer" from "IP Camera" would confidently misidentify every channel of
+    a recorder like mine.
+    """
+    if not isinstance(data, dict):
+        return None
+    for key in ("table.RemoteDevice.uuid:System_CONFIG_NETCAMERA_INFO_{0}.DeviceType",
+                "table.RemoteDevice[{0}].DeviceType"):
+        value = data.get(key.format(channel))
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value.lower() in GENERIC_DEVICE_TYPES:
+            return None
+        return value
+    return None
 
 
 WHITE_LIGHT_SCHEME = "WhiteMode"
@@ -852,6 +969,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self._supports_smart_motion_detection = False
         self._supports_ptz_position = False
         self._supports_lighting = False
+        self._supports_day_night_color = False
+        self._channel_model = None
         self._supports_privacy_mode = False
         self._supports_floodlightmode = False
         self._serial_number: str
@@ -1120,12 +1239,54 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
                 # Smart motion detection is enabled/disabled/fetched differently on Dahua devices compared to Amcrest
                 # The following lines are for Dahua devices
+                smart_motion_rows = None
                 try:
-                    await self.client.async_get_smart_motion_detection()
+                    table = await self.client.async_get_smart_motion_detection()
                     self._supports_smart_motion_detection = True
+                    smart_motion_rows = smart_motion_row_indices(table)
                 except PROBE_FAILED:
                     self._supports_smart_motion_detection = False
                 _LOGGER.debug("Device supports smart motion detection=%s", self._supports_smart_motion_detection)
+
+                # Day/Night mode. Judged by whether this channel's row came
+                # back, not by whether the request raised: async_get_config
+                # swallows a ClientResponseError and returns {}, and a device
+                # can answer 200 with an empty body for a table it lacks.
+                try:
+                    options = await self.client.async_get_video_in_options()
+                    self._supports_day_night_color = (
+                        day_night_color_name(options, self._channel) is not None)
+                except PROBE_FAILED:
+                    self._supports_day_night_color = False
+                _LOGGER.debug("Device supports day/night mode=%s", self._supports_day_night_color)
+
+                # Which camera is actually on this channel. Every channel of a
+                # recorder reports the recorder's model, so a doorbell behind an
+                # NVR is invisible as one and every model-string capability
+                # check sees the wrong device. Read once at setup: RemoteDevice
+                # is large and never changes between reboots, and the shared read
+                # cache answers it once for all of a recorder's channels.
+                try:
+                    remote = await self.client.async_get_config("RemoteDevice")
+                    self._channel_model = remote_device_model(remote, self._channel)
+                except PROBE_FAILED:
+                    self._channel_model = None
+                if self._channel_model:
+                    _LOGGER.debug(
+                        "Channel %s carries a %s; the device itself reports %s",
+                        self._channel, self._channel_model, self.model)
+                if self._supports_smart_motion_detection:
+                    # Which rows the device reports is the whole capability
+                    # decision for this channel (#635), and nothing logged it.
+                    # #669 spent two rounds of guessing for want of this line,
+                    # because a response body is never logged at debug.
+                    _LOGGER.debug(
+                        "SmartMotionDetect rows reported: %s; this channel is %s, so its "
+                        "switch is %s",
+                        smart_motion_rows if smart_motion_rows else "none",
+                        self._channel,
+                        "created" if self._channel in (smart_motion_rows or ()) else "not created",
+                    )
 
                 is_doorbell = self.is_doorbell()
                 _LOGGER.debug("Device is a doorbell=%s", is_doorbell)
@@ -1246,6 +1407,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 coros.append(asyncio.ensure_future(self.client.async_get_config_motion_detection()))
             # Only the preset position select reads this, and it is one of the
             # two per-poll calls the config cache does not cover.
+            if self._supports_day_night_color and self._wanted_by(SELECT):
+                coros.append(asyncio.ensure_future(self.client.async_get_video_in_options()))
             if self._supports_ptz_position and self._wanted_by(SELECT):
                 coros.append(asyncio.ensure_future(_ptz_position()))
             if self.supports_infrared_light() and self._wanted_by(LIGHT):
@@ -1709,6 +1872,14 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """ returns the device model, e.g. IPC-HDW3849HP-AS-PV """
         return self.model
 
+    def get_channel_model(self):
+        """The model of the camera on this channel, or None if unknown.
+
+        Deliberately separate from get_model(), which still answers what the
+        device itself reports. Nothing is gated on this yet -- see #690.
+        """
+        return self._channel_model
+
     def get_firmware_version(self) -> str:
         """The firmware the device reported, e.g. 2.800.0000016.0.R.
 
@@ -1799,14 +1970,31 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         return self.events
 
+    def get_infrared_profile(self) -> str:
+        """The Lighting profile this channel's infrared light is really using."""
+        return infrared_profile(self.data, self._channel, self.get_profile_mode())
+
+
+    def supports_day_night_color(self) -> bool:
+        """True if this channel reported a Day/Night mode we understand."""
+        return self._supports_day_night_color
+
+    def get_day_night_color(self):
+        """This channel's Day/Night mode by name, or None."""
+        return day_night_color_name(self.data, self._channel)
+
     def is_infrared_light_on(self) -> bool:
         """ returns true if the infrared light is on """
-        return self.data.get("table.Lighting[{0}][0].Mode".format(self._channel),"") == "Manual"
+        return self.data.get(
+            "table.Lighting[{0}][{1}].Mode".format(
+                self._channel, self.get_infrared_profile()), "") == "Manual"
 
     def get_infrared_brightness(self) -> int:
         """Return the brightness of this light, as reported by the camera itself, between 0..255 inclusive"""
 
-        bri = self.data.get("table.Lighting[{0}][0].MiddleLight[0].Light".format(self._channel))
+        bri = self.data.get(
+            "table.Lighting[{0}][{1}].MiddleLight[0].Light".format(
+                self._channel, self.get_infrared_profile()))
         return dahua_utils.dahua_brightness_to_hass_brightness(bri)
 
     def get_illuminator_index(self) -> int:

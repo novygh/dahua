@@ -347,6 +347,11 @@ def flatten_rpc2_config(name: str, node, prefix: str = None) -> dict:
 
 
 SECURITY_LIGHT_TYPE = 1
+
+# VideoInOptions[channel].DayNightColor, the portable spelling of the Day/Night
+# setting. Verified present on a DHI-NVR5464-16P-EI, a VTO, and the
+# DHI-VTO2311R-WP on #687, none of which carry VideoInDayNight at all.
+DAY_NIGHT_COLOR = {"Color": 0, "Brightness": 1, "BlackWhite": 2}
 SIREN_TYPE = 2
 
 
@@ -1150,14 +1155,59 @@ class DahuaClient:
             except Exception:
                 _LOGGER.debug("RPC2 logout failed after %s", description, exc_info=True)
 
+    async def async_privacy_mode_over_cgi(self):
+        """This camera's LeLensMask row read over plain CGI, or None.
+
+        Judged by what comes back rather than by an exception, for the reason
+        async_detect_lighting_support gives: async_get_config swallows a
+        ClientResponseError and returns {}, and a device can also answer 200
+        with an empty body for a table it does not have -- a recorder on #669
+        does exactly that for VideoAnalyseRule. Neither of those is "privacy
+        mode is off", so only a response actually carrying the key counts.
+        """
+        data = await self.async_get_config("LeLensMask")
+        if not data:
+            return None
+        for key, value in data.items():
+            if key.startswith("table.LeLensMask[") and key.endswith("].Enable"):
+                return str(value).strip().lower() == "true"
+        return None
+
     async def async_get_privacy_mode(self) -> bool:
-        """Return True if the camera's lens privacy mask is enabled."""
+        """Return True if the camera's lens privacy mask is enabled.
+
+        CGI first. The RPC2 route came first historically, but #379 has a camera
+        -- an IP4M-1041W -- whose LeLensMask is readable and writable over CGI
+        while RPC2 answers `Authority:check failure`, which looks like a
+        permissions problem and is not one. Plain CGI is also what the Amcrest
+        integration uses for this, and it costs no login of its own, where the
+        RPC2 path logs in and out around every call.
+
+        RPC2 stays as the fallback: it is the route the feature was built and
+        verified on, and a camera that answers only there must keep working.
+        """
+        over_cgi = await self.async_privacy_mode_over_cgi()
+        if over_cgi is not None:
+            return over_cgi
         return await self._async_privacy_mode_rpc2(
             lambda rpc2: rpc2.async_get_privacy_mode(), "privacy mode read"
         )
 
     async def async_set_privacy_mode(self, enabled: bool) -> None:
-        """Enable or disable the camera's lens privacy mask."""
+        """Enable or disable the camera's lens privacy mask.
+
+        Written over whichever transport can read it, so the write never goes
+        somewhere the state is not read back from.
+
+        The CGI write names only Enable. setConfig merges, so the camera keeps
+        its own TimeSection schedule -- which is what the RPC2 path takes the
+        trouble to read back and rewrite by hand.
+        """
+        if await self.async_privacy_mode_over_cgi() is not None:
+            url = "/cgi-bin/configManager.cgi?action=setConfig&LeLensMask[0].Enable={0}".format(
+                str(bool(enabled)).lower())
+            await self.get(url, True)
+            return
         await self._async_privacy_mode_rpc2(
             lambda rpc2: rpc2.async_set_privacy_mode(enabled), "privacy mode write"
         )
@@ -1188,13 +1238,14 @@ class DahuaClient:
         url = "/cgi-bin/configManager.cgi?action=setConfig&FloodLightMode.Mode={mode}".format(mode=mode)
         return await self.get(url)
 
-    async def async_set_lighting_v1(self, channel: int, enabled: bool, brightness: int) -> dict:
+    async def async_set_lighting_v1(self, channel: int, enabled: bool, brightness: int,
+                                    profile_mode="0") -> dict:
         """ async_get_lighting_v1 will turn the IR light (InfraRed light) on or off """
         # on = Manual, off = Off
         mode = "Manual"
         if not enabled:
             mode = "Off"
-        return await self.async_set_lighting_v1_mode(channel, mode, brightness)
+        return await self.async_set_lighting_v1_mode(channel, mode, brightness, profile_mode)
 
     async def async_set_lighting_v2_mode(self, channel: int, mode: str, brightness: int,
                                          profile_mode: str, light_index: int = 0,
@@ -1223,7 +1274,8 @@ class DahuaClient:
         )
         return await self.get(url)
 
-    async def async_set_lighting_v1_mode(self, channel: int, mode: str, brightness: int) -> dict:
+    async def async_set_lighting_v1_mode(self, channel: int, mode: str, brightness: int,
+                                         profile_mode="0") -> dict:
         """
         async_set_lighting_v1_mode will set IR light (InfraRed light) mode and brightness
         Mode should be one of: Manual, Off, or Auto
@@ -1235,8 +1287,14 @@ class DahuaClient:
         # Dahua api expects the first char to be capital
         mode = mode.capitalize()
 
-        url = "/cgi-bin/configManager.cgi?action=setConfig&Lighting[{channel}][0].Mode={mode}&Lighting[{channel}][0].MiddleLight[0].Light={brightness}".format(
-            channel=channel, mode=mode, brightness=brightness
+        # The profile is the caller's, not a hardcoded 0. The poll reads this
+        # channel's live profile, so writing to 0 wrote somewhere the state is
+        # not read back from, and on a camera running night the camera is not
+        # rendering from it either.
+        url = ("/cgi-bin/configManager.cgi?action=setConfig"
+               "&Lighting[{channel}][{profile}].Mode={mode}"
+               "&Lighting[{channel}][{profile}].MiddleLight[0].Light={brightness}").format(
+            channel=channel, profile=profile_mode, mode=mode, brightness=brightness
         )
         return await self.get(url)
 
@@ -1460,9 +1518,45 @@ class DahuaClient:
         url = "/cgi-bin/configManager.cgi?action=setConfig&VideoInDayNight[{0}][{1}].Mode={2}".format(
             channel, str(config_no), mode
         )
+        try:
+            value = await self.get(url)
+            if "OK" in value or "ok" in value:
+                return
+        except aiohttp.ClientResponseError:
+            pass
+
+        # Plenty of devices do not have VideoInDayNight at all. Measured:
+        # a DHI-NVR5464-16P-EI answers 400 Bad Request, a VTO answers "Unknown
+        # error", and the DHI-VTO2311R-WP on #687 answers 400 -- while all three
+        # carry VideoInOptions[channel].DayNightColor, which is what their own
+        # web UI writes.
+        #
+        # Note this key is not profile scoped: VideoInOptions also carries
+        # NightOptions.DayNightColor and NormalOptions.DayNightColor, and the
+        # bare one is the setting the web UI exposes and the one verified to
+        # work. So config_type has no effect on this path, and saying so is
+        # better than picking a profile on a guess.
+        url = "/cgi-bin/configManager.cgi?action=setConfig&VideoInOptions[{0}].DayNightColor={1}".format(
+            channel, DAY_NIGHT_COLOR[mode]
+        )
         value = await self.get(url)
         if "OK" not in value and "ok" not in value:
             raise Exception("Could not set Day/Night mode")
+
+    async def async_get_video_in_options(self) -> dict:
+        """The VideoInOptions table, which carries this device's Day/Night mode.
+
+        Read whole, because neither narrower spelling works: measured on a
+        DHI-NVR5464-16P-EI and a VTO, both `name=VideoInOptions[0]` and
+        `name=VideoInOptions[0].DayNightColor` return an empty 200.
+
+        It is a host-wide getConfig, so the shared read cache answers it for
+        every channel of a recorder and holds it for CONFIG_CACHE_TTL_SECONDS --
+        one fetch per five minutes per host rather than one per poll. A write
+        clears that cache for the device, so setting the mode is reflected on
+        the next read rather than up to five minutes later.
+        """
+        return await self.async_get_config("VideoInOptions")
 
     async def async_get_video_in_mode(self) -> dict:
         """
