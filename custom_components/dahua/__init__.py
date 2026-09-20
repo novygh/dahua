@@ -346,6 +346,51 @@ def remote_device_model(data: dict, channel: int):
     return None
 
 
+def model_name(resolved, reported) -> str:
+    """The model string to gate capabilities on, never None.
+
+    getSystemInfo answers `deviceType` for cameras, but recorders answer a
+    number (Lorex sends 31) or omit it entirely, with the real model in
+    `updateSerial`. #59 was a DVR that omitted it, and setup died on
+    `'NoneType' object has no attribute 'upper'`. That was fixed by falling
+    back to `updateSerial`, and then to getDeviceType.
+
+    Both fallbacks can still come back empty -- getDeviceType answering an
+    empty body, or an error string with no "=" in it, leaves `.get("type")`
+    None again -- so the crash is still reachable by a different road. Two
+    things keep it shut:
+
+    `reported` is the generic value the fallback chain set out to improve on.
+    Preferring it to nothing means a device calling itself "IP Camera" stays
+    "IP Camera" instead of becoming None the moment the more specific lookups
+    come back empty.
+
+    And the result is always a string, so a device that answers nothing useful
+    ends up with "" -- which every capability check reads as a model matching
+    no prefix, leaving its feature off. That is the right outcome for an
+    unknown device, and it is what the attribute is initialised to.
+    """
+    return (resolved or reported or "").strip()
+
+
+def door_index(event: dict) -> int:
+    """Which door a VTO DoorStatus event is about.
+
+    The door number arrives in the event's `Index`, 0-based. A VTO paired with
+    an access control extension module has a second door and reports it as 1
+    (#488).
+
+    Anything missing, negative or unreadable is the first door. That is what a
+    single-door VTO sends -- and `Index: -1` is what the same device puts on a
+    BackKeyLight event, so a negative is "not a door number" rather than a door.
+    """
+    try:
+        index = int(event.get("Index"))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, index)
+
+
 WHITE_LIGHT_SCHEME = "WhiteMode"
 
 
@@ -963,6 +1008,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self.connected = None
         self.events: list = events
         self._supports_coaxial_control = False
+        self._alarm_output_slots = 0
         self._nvr_active_deterrence = entry.options.get(CONF_NVR_ACTIVE_DETERRENCE, False)
         self._supports_disarming_linkage = False
         self._supports_event_notifications = False
@@ -1166,6 +1212,9 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 data.update(version)
 
                 device_type = data.get("deviceType", None)
+                # Kept so the chain below can fall back to it: it is generic,
+                # but it beats the None a failed lookup would otherwise leave.
+                reported_type = device_type
                 # Lorex NVRs return deviceType=31, but the model is in the updateSerial
                 # /cgi-bin/magicBox.cgi?action=getSystemInfo"
                 # deviceType=31
@@ -1179,6 +1228,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                         # If it's still none, then call the device type API
                         dt = await self.client.get_device_type()
                         device_type = dt.get("type")
+                device_type = model_name(device_type, reported_type)
                 data["model"] = device_type
                 self.model = device_type
                 self.machine_name = data.get("table.General.MachineName")
@@ -1209,6 +1259,22 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 except PROBE_REFUSED:
                     self._supports_coaxial_control = False
                 _LOGGER.debug("Device supports Coaxial Control=%s", self._supports_coaxial_control)
+
+                try:
+                    alarm_output_data = await self.client.async_get_alarm_output_slots()
+                    try:
+                        self._alarm_output_slots = max(0, int(alarm_output_data.get("result", "0")))
+                    except (ValueError, TypeError):
+                        self._alarm_output_slots = 0
+                except PROBE_FAILED:
+                    self._alarm_output_slots = 0
+                _LOGGER.debug("Device alarm output slots=%s", self._alarm_output_slots)
+                if self._alarm_output_slots > 1:
+                    _LOGGER.debug(
+                        "Device reports %s alarm outputs; entities are not created because "
+                        "the multi-output getOutState encoding is not yet verified",
+                        self._alarm_output_slots,
+                    )
 
                 try:
                     await self.client.async_get_disarming_linkage()
@@ -1418,6 +1484,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 coros.append(asyncio.ensure_future(self.client.async_get_disarming_linkage()))
             if self._supports_event_notifications and self._wanted_by(SWITCH):
                 coros.append(asyncio.ensure_future(self.client.async_get_event_notifications()))
+            if self.supports_alarm_output() and self._wanted_by(SWITCH):
+                coros.append(asyncio.ensure_future(self.client.async_get_alarm_output_state()))
             # The siren switch and the security light both read this one.
             if self._supports_coaxial_control and self._wanted_by(LIGHT, SWITCH):
                 coaxial_channel = self._channel_number if self.is_nvr_channel() else 1
@@ -1577,6 +1645,15 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     listener()
                 elif action == "Pulse":
                     if code == "DoorStatus":
+                        # The door number is in Index, and it was being thrown
+                        # away. A VTO with an access control extension module
+                        # has a second door whose events carry Index 1 (#488),
+                        # and every one of them landed on the single Door Status
+                        # sensor -- so door 2 closing reported door 1 as closed
+                        # while it stood open. One sensor exists, it is door 1's,
+                        # and only door 1 may write to it.
+                        if door_index(event) != 0:
+                            continue
                         if event.get("Data", {}).get("Status", "") == "Open":
                             self._dahua_event_timestamp[event_key] = int(time.time())
                         else:
@@ -1708,6 +1785,14 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     def supports_disarming_linkage(self) -> bool:
         """Whether the device answered the disarming linkage read during setup."""
         return self._supports_disarming_linkage
+
+    def supports_alarm_output(self) -> bool:
+        """Whether a safely decodable single alarm output is available."""
+        return self._alarm_output_slots == 1
+
+    def is_alarm_output_on(self) -> bool:
+        """Return the physical state reported by getOutState."""
+        return self.data.get("status.AlarmOut[0]") == "1"
 
     def supports_profile_mode(self) -> bool:
         """Whether this device has selectable day/night/general profiles.
@@ -1961,7 +2046,12 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         if not plate or plate == "unknown":
             return False
         norm = dahua_utils.normalize_plate(plate)
-        return norm in self.get_authorized_plates()
+        auth_plates = self.get_authorized_plates()
+        if norm in auth_plates:
+            return True
+        # Equate 0 and O OCR confusions as fallback
+        norm_fuzzy = norm.replace("0", "O")
+        return any(norm_fuzzy == p.replace("0", "O") for p in auth_plates)
 
     def get_event_list(self) -> list:
         """
@@ -2140,8 +2230,31 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         return self._channel
 
     def is_nvr_channel(self) -> bool:
-        """Return whether this entry represents a camera channel on an NVR."""
-        return self._channel > 0 or "NVR" in self.model.upper()
+        """Return whether this entry represents a camera channel on an NVR.
+
+        Channel 0 is the awkward one. It is both the only channel a standalone
+        camera has and the first channel of every recorder, so the model string
+        is all that separates them -- and plenty of recorders do not say "NVR"
+        in theirs. A Lorex N843A8 does not, nor do most OEM rebrands.
+
+        The consequence was silent and lopsided: a user who switched on NVR
+        active deterrence got the entity on channels 1 upwards and nothing at
+        all on channel 0, because that channel took the standalone-camera branch
+        and was tested against a model whitelist the recorder can never match.
+
+        So the option counts as an answer. It is offered for recorders, it
+        defaults off, and a user who turns it on has said what this entry is
+        more directly than any model string does.
+
+        This decides the control path as well as whether the entity exists --
+        an NVR channel drives deterrence through coaxialControlIO on its own
+        channel number, a camera through its channel index -- so the two have to
+        be decided by the same question or the entity would appear and then
+        write to the wrong place.
+        """
+        return (self._channel > 0
+                or "NVR" in self.model.upper()
+                or self._nvr_active_deterrence)
 
     def get_channel_number(self) -> int:
         """returns the channel number of this camera"""
@@ -2176,8 +2289,21 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         return self._smart_motion_row() is not None
 
     def supports_smart_motion_detection_amcrest(self) -> bool:
-        """ True if smart motion detection is supported for an amcrest device"""
-        return self.model == "AD410" or self.model == "DB61i"
+        """ True if smart motion detection is supported for an amcrest device
+
+        Matched the way is_amcrest_doorbell matches, which is the point: these
+        two questions are about the same devices and disagreed. That one folds
+        case and takes a prefix; this one compared the raw string exactly, so a
+        doorbell reporting `DB61I` rather than `DB61i` was a doorbell to one
+        check and not to the other.
+
+        A device that falls through here is not merely missing its switch. The
+        smart motion state and the write both take the non-Amcrest branch, which
+        reads SmartMotionDetect -- a table an Amcrest doorbell does not have --
+        so it reports nothing and its IVS rule is never touched.
+        """
+        model = self.model.upper()
+        return model.startswith("AD410") or model.startswith("DB61")
 
     def supports_privacy_mode(self) -> bool:
         """ True if the camera exposes the lens privacy mask over RPC2 """
@@ -2258,3 +2384,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload config entry."""
     await hass.config_entries.async_reload(entry.entry_id)
+

@@ -559,6 +559,58 @@ def lighting_scheme_illuminator_tables(
     return scheme, lighting
 
 
+# 1 main stream + 2 sub-streams, which is what the coordinator starts with and
+# what the comment in get_max_extra_streams has always described.
+DEFAULT_EXTRA_STREAMS = 2
+
+
+def parse_extra_streams(value) -> int:
+    """How many sub-streams the device says it has, as a usable number.
+
+    Measured, because the shape of this answer decides how many camera
+    entities get created:
+
+        DHI-NVR5464-16P-EI (G61_NVR16PRO16P-I3)   table.MaxExtraStream=2
+        VTO2000A doorbell                         table.MaxExtraStream=1
+
+    A doorbell really does answer 1, and #237 is an AD410 owner whose log fills
+    with `Error opening stream ... subtype=2` for a sub-stream that does not
+    exist. So over-guessing this is not harmless -- it is a camera entity that
+    404s on every attempt, for as long as the entry exists.
+
+    Anything unreadable falls back to the common case rather than raising. The
+    caller is inside the one-time init block, whose handler turns any exception
+    into UpdateFailed, so a device answering a non-numeric value here would
+    never finish initialising and would retry for as long as it kept saying it.
+    """
+    try:
+        count = int(str(value).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_EXTRA_STREAMS
+    # A negative count is not a smaller camera, it is a device talking nonsense.
+    if count < 0:
+        return DEFAULT_EXTRA_STREAMS
+    return count
+
+
+def _is_login_refused(exception: aiohttp.ClientResponseError) -> bool:
+    """True when the device refused the credentials, not the endpoint.
+
+    The identity calls below fall back to an id built from the credentials when
+    magicBox.cgi answers with an error, which is how cameras that do not
+    implement it at all are still supported. That fallback is right for a 404 or
+    a 501 -- the device has no such endpoint -- and wrong for a 401, where the
+    device understood the request perfectly and rejected the login. Synthesising
+    an identity from a password the camera has just refused is how a wrong
+    password came to produce a working-looking camera that never polls.
+
+    403 deliberately keeps the fallback. It means the login was accepted and
+    this account is not allowed that endpoint, which a restricted Dahua user
+    really can hit, and their credentials are not wrong.
+    """
+    return exception.status == 401
+
+
 class DahuaClient:
     """
     DahuaClient is the client for accessing Dahua IP Cameras. The APIs were discovered from the "API of HTTP Protocol Specification" V2.76 2019-07-25 document
@@ -665,6 +717,8 @@ class DahuaClient:
         try:
             return await self.get("/cgi-bin/magicBox.cgi?action=getSystemInfo")
         except aiohttp.ClientResponseError as e:
+            if _is_login_refused(e):
+                raise
             self.identity_derived_from_credentials = True
             not_hashed_id = "{0}_{1}_{2}_{3}".format(self._address, self._rtsp_port, self._username, self._password)
             unique_cam_id = md5(not_hashed_id.encode('UTF-8')).hexdigest()
@@ -698,6 +752,8 @@ class DahuaClient:
         try:
             return await self.get("/cgi-bin/magicBox.cgi?action=getMachineName")
         except aiohttp.ClientResponseError as e:
+            if _is_login_refused(e):
+                raise
             self.identity_derived_from_credentials = True
             not_hashed_id = "{0}_{1}_{2}_{3}".format(self._address, self._rtsp_port, self._username, self._password)
             unique_cam_id = md5(not_hashed_id.encode('UTF-8')).hexdigest()
@@ -718,11 +774,38 @@ class DahuaClient:
         """ get_max_extra_streams returns the max number of sub streams supported by the camera """
         try:
             result = await self.get("/cgi-bin/magicBox.cgi?action=getProductDefinition&name=MaxExtraStream")
-            return int(result.get("table.MaxExtraStream", "2"))
-        except aiohttp.ClientResponseError as e:
-            pass
-        # If we can't fetch, just assume 2 since that's pretty standard
-        return 3
+        except aiohttp.ClientResponseError:
+            # No such endpoint on this device. Assume the standard 2, which is
+            # what this comment has always said -- the code returned 3.
+            return DEFAULT_EXTRA_STREAMS
+        return parse_extra_streams(result.get("table.MaxExtraStream"))
+
+    async def async_get_alarm_output_slots(self) -> dict:
+        """Return the number of physical alarm-output slots reported by the device."""
+        return await self.get("/cgi-bin/alarm.cgi?action=getOutSlots")
+
+    async def async_get_alarm_output_state(self) -> dict:
+        """Return the physical alarm-output state.
+
+        The response is deliberately left unmodified. Single-output devices
+        return ``result=0`` or ``result=1``; the encoding for devices with
+        multiple outputs has not yet been verified.
+        """
+        data = await self.get("/cgi-bin/alarm.cgi?action=getOutState")
+        return {"status.AlarmOut[0]": data.get("result")}
+
+    async def async_set_alarm_output_state(self, output: int, enabled: bool) -> dict:
+        """Force one alarm output on or off.
+
+        AlarmOut.Mode is a three-state control mode, not a boolean: 0 is Auto,
+        1 is Manual/Force ON, and 2 is Close/Force OFF.
+        """
+        mode = 1 if enabled else 2
+        url = (
+            "/cgi-bin/configManager.cgi?action=setConfig&"
+            "AlarmOut[{output}].Mode={mode}"
+        ).format(output=output, mode=mode)
+        return await self.get(url)
 
     async def async_get_coaxial_control_io_status(self, channel: int = 1) -> dict:
         """
@@ -736,16 +819,6 @@ class DahuaClient:
         status.status.WhiteLight=Off
         """
         url = "/cgi-bin/coaxialControlIO.cgi?action=getStatus&channel={channel}".format(channel=channel)
-        return await self.get(url)
-
-    async def async_get_lighting_scheme(self) -> dict:
-        """Which emitter the camera is willing to use, on Smart Dual Light models.
-
-        Deliberately not part of the poll. This is read when a light command is
-        given -- rare, and user initiated -- rather than on every poll for the
-        sake of a warning most devices never need.
-        """
-        url = "/cgi-bin/configManager.cgi?action=getConfig&name=LightingScheme"
         return await self.get(url)
 
     async def async_get_lighting_v2(self) -> dict:
@@ -1000,11 +1073,38 @@ class DahuaClient:
         return {}
 
     async def async_get_lighting_scheme(self) -> dict:
-        """Read LightingScheme through CGI regardless of RPC2 polling mode."""
-        return await self._request(
-            "/cgi-bin/configManager.cgi?action=getConfig&name=LightingScheme",
-            allow_rpc2=False,
-        )
+        """Which emitter the camera is willing to use, on Smart Dual Light models.
+
+        Deliberately not part of the poll. This is read when a light command is
+        given -- rare, and user initiated -- rather than on every poll for the
+        sake of a warning most devices never need.
+
+        CGI first, because that is what a camera answers and it costs no login.
+        RPC2 when CGI will not answer: a recorder refuses
+        getConfig&name=LightingScheme with 400 -- measured on a
+        DHI-NVR5464-16P-EI and on the recorder in #647 -- while the same table
+        reads perfectly over RPC2 on that second device.
+
+        That gap is the whole reason the warning exists. #647's white light was
+        held off by LightingMode=AIMode for weeks, the camera accepted every
+        write and lit nothing, and the check that would have said so could not
+        run because the only transport it tried was the one that recorder
+        refuses.
+
+        Judged by what comes back, not by whether something was raised:
+        _request returns {} for a table a device does not have, and that is not
+        a scheme.
+        """
+        try:
+            over_cgi = await self._request(
+                "/cgi-bin/configManager.cgi?action=getConfig&name=LightingScheme",
+                allow_rpc2=False,
+            )
+            if over_cgi:
+                return over_cgi
+        except aiohttp.ClientResponseError:
+            pass
+        return await self._rpc2_get_config("LightingScheme")
 
     async def async_set_lighting_scheme_illuminator(
             self, channel: int, enabled: bool, brightness: int,
@@ -1156,7 +1256,7 @@ class DahuaClient:
                 _LOGGER.debug("RPC2 logout failed after %s", description, exc_info=True)
 
     async def async_privacy_mode_over_cgi(self):
-        """This camera's LeLensMask row read over plain CGI, or None.
+        """(row index, enabled) for this camera's LeLensMask, or None.
 
         Judged by what comes back rather than by an exception, for the reason
         async_detect_lighting_support gives: async_get_config swallows a
@@ -1164,13 +1264,23 @@ class DahuaClient:
         with an empty body for a table it does not have -- a recorder on #669
         does exactly that for VideoAnalyseRule. Neither of those is "privacy
         mode is off", so only a response actually carrying the key counts.
+
+        The index is returned, and not assumed, because the write has to reach
+        the row the state was read from. Accepting any row while always writing
+        row 0 would be a control that reports one thing and changes another on
+        any device that reports more than one -- the shape of #679, #683 and
+        #689. Which row a device uses is not something I can check: neither of
+        mine carries this table at all.
+
+        Lowest index first, so the answer does not depend on dict ordering.
         """
         data = await self.async_get_config("LeLensMask")
         if not data:
             return None
-        for key, value in data.items():
-            if key.startswith("table.LeLensMask[") and key.endswith("].Enable"):
-                return str(value).strip().lower() == "true"
+        for key in sorted(data):
+            match = re.match(r"table\.LeLensMask\[(\d+)\]\.Enable$", key)
+            if match:
+                return int(match.group(1)), str(data[key]).strip().lower() == "true"
         return None
 
     async def async_get_privacy_mode(self) -> bool:
@@ -1188,7 +1298,7 @@ class DahuaClient:
         """
         over_cgi = await self.async_privacy_mode_over_cgi()
         if over_cgi is not None:
-            return over_cgi
+            return over_cgi[1]
         return await self._async_privacy_mode_rpc2(
             lambda rpc2: rpc2.async_get_privacy_mode(), "privacy mode read"
         )
@@ -1203,9 +1313,10 @@ class DahuaClient:
         its own TimeSection schedule -- which is what the RPC2 path takes the
         trouble to read back and rewrite by hand.
         """
-        if await self.async_privacy_mode_over_cgi() is not None:
-            url = "/cgi-bin/configManager.cgi?action=setConfig&LeLensMask[0].Enable={0}".format(
-                str(bool(enabled)).lower())
+        row = await self.async_privacy_mode_over_cgi()
+        if row is not None:
+            url = ("/cgi-bin/configManager.cgi?action=setConfig"
+                   "&LeLensMask[{0}].Enable={1}").format(row[0], str(bool(enabled)).lower())
             await self.get(url, True)
             return
         await self._async_privacy_mode_rpc2(
@@ -1776,9 +1887,40 @@ class DahuaClient:
             response = await auth.request("GET", url, timeout=timeout)
             response.raise_for_status()
 
-            # https://docs.aiohttp.org/en/stable/streams.html
+            # Buffer chunks until boundary delimiters so large event payloads (e.g. ANPR JSON)
+            # are never split across TCP chunk boundaries.
+            boundary = b"--myboundary"
+            content_type = response.headers.get("Content-Type", "")
+            if "boundary=" in content_type:
+                b_val = content_type.split("boundary=")[1].split(";")[0].strip().strip('"\'')
+                if b_val:
+                    boundary = b"--" + b_val.encode()
+
+            buffer = b""
             async for data, _ in response.content.iter_chunks():
-                on_receive(data, channel)
+                # If stream contains multipart boundaries, buffer chunks until boundary delimiters
+                # so large event payloads (e.g. ANPR JSON) are never split across TCP chunk boundaries.
+                if boundary in data or boundary in buffer:
+                    buffer += data
+                    while True:
+                        idx1 = buffer.find(boundary)
+                        if idx1 == -1:
+                            if len(buffer) > 131072:
+                                buffer = buffer[-4096:]
+                            break
+                        idx2 = buffer.find(boundary, idx1 + len(boundary))
+                        if idx2 == -1:
+                            if idx1 > 0:
+                                buffer = buffer[idx1:]
+                            break
+                        complete_part = buffer[idx1:idx2]
+                        buffer = buffer[idx2:]
+                        on_receive(complete_part, channel)
+                else:
+                    on_receive(data, channel)
+
+            if buffer and buffer.startswith(boundary) and len(buffer.strip()) > len(boundary):
+                on_receive(buffer, channel)
         finally:
             if response is not None:
                 response.close()
@@ -1955,3 +2097,4 @@ class DahuaClient:
             return "Sub"
         else:
             return "Sub_{0}".format(subtype)
+
