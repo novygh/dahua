@@ -373,6 +373,46 @@ def model_name(resolved, reported) -> str:
     return (resolved or reported or "").strip()
 
 
+def remote_device_protocol(data: dict, channel: int):
+    """How the recorder reaches the camera on this channel, lowercased.
+
+    Sits beside the ProtocolType that remote_device_model reads DeviceType
+    from, and accepts the same two spellings:
+
+        table.RemoteDevice.uuid:System_CONFIG_NETCAMERA_INFO_10.ProtocolType=Onvif
+
+    Measured on a DHI-NVR5464-16P-EI, fifteen populated channels: fourteen
+    report `Private` and one reports `Onvif`. That one is the reason this
+    exists -- see is_onvif_channel.
+    """
+    if not isinstance(data, dict):
+        return None
+    for key in ("table.RemoteDevice.uuid:System_CONFIG_NETCAMERA_INFO_{0}.ProtocolType",
+                "table.RemoteDevice[{0}].ProtocolType"):
+        value = data.get(key.format(channel))
+        if value is None:
+            continue
+        value = str(value).strip().lower()
+        return value or None
+    return None
+
+
+def is_onvif_channel(data: dict, channel: int) -> bool:
+    """True when the recorder reaches this camera over ONVIF rather than Dahua.
+
+    Such a channel is not served on the recorder's own Dahua paths. Measured on
+    a DHI-NVR5464-16P-EI, same recorder, same request, same minute:
+
+        index 10  ch=11  Onvif    snapshot.cgi -> 400 Bad Request, no image
+        index  1  ch=2   Private  snapshot.cgi -> 200, 1,420,074 bytes
+        index 11  ch=12  Private  snapshot.cgi -> 200,   175,172 bytes
+
+    Its RTSP path times out as well. So the camera exists, streams, and is
+    visible to the recorder -- and nothing this integration asks for reaches it.
+    """
+    return remote_device_protocol(data, channel) == "onvif"
+
+
 def door_index(event: dict) -> int:
     """Which door a VTO DoorStatus event is about.
 
@@ -958,7 +998,24 @@ class DahuaHostEventStream:
             # A channel nobody has configured stays silent, exactly as it did
             # when every coordinator discarded it.
             for coordinator in self._by_channel.get(index, ()):
-                coordinator.handle_event(dict(event))
+                try:
+                    coordinator.handle_event(dict(event))
+                except Exception:  # pylint: disable=broad-except
+                    # This stream is shared by every channel on the host, and
+                    # stream_events wraps its call to on_receive in try/finally
+                    # with no handler -- so an exception here does not just lose
+                    # this event, it leaves the read loop and takes events for
+                    # every camera on the device down until the retry
+                    # reconnects. One malformed payload did exactly that (#475).
+                    #
+                    # Per coordinator rather than per event, so a channel whose
+                    # handler fails does not rob the other channels of an event
+                    # they could have handled.
+                    _LOGGER.warning(
+                        "Unhandled error while handling a %s event from %s on channel %s; "
+                        "the event is dropped and the stream continues",
+                        event.get("Code", "?"), self._address, index, exc_info=True,
+                    )
 
 
 # address -> DahuaHostEventStream
@@ -1335,6 +1392,20 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 try:
                     remote = await self.client.async_get_config("RemoteDevice")
                     self._channel_model = remote_device_model(remote, self._channel)
+                    if is_onvif_channel(remote, self._channel):
+                        # Say it once, plainly, instead of leaving a camera
+                        # entity that answers 400 for the life of the entry.
+                        _LOGGER.warning(
+                            "Channel %s of %s is attached to the recorder over ONVIF, "
+                            "not Dahua's own protocol. A recorder does not serve such a "
+                            "channel on its Dahua paths -- measured on a "
+                            "DHI-NVR5464-16P-EI, snapshot.cgi answers 400 for the ONVIF "
+                            "channel while every Dahua-protocol channel on the same "
+                            "recorder returns an image -- so video for this camera will "
+                            "not work here whatever channel number is used. Home "
+                            "Assistant's own ONVIF integration, pointed at the recorder "
+                            "rather than at the camera, does serve it (#646).",
+                            self._channel, self._address)
                 except PROBE_FAILED:
                     self._channel_model = None
                 if self._channel_model:
@@ -1500,7 +1571,18 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 coros.append(asyncio.ensure_future(self.client.async_get_video_analyse_rules_for_amcrest()))
             if self.is_amcrest_doorbell() and self._wanted_by(LIGHT):
                 coros.append(asyncio.ensure_future(self.client.async_get_light_global_enabled()))
-            if self._supports_lighting_v2 and self._wanted_by(LIGHT):   #add lighing_v2 API if it is supported
+            # Lighting_V2 is the light platform's table -- except that the
+            # Amcrest doorbell's "Security Light" is a *select*, and its
+            # current_option reads table.Lighting_V2[0][0][1].Mode/.State. A
+            # select is not a light, so gating this on LIGHT alone left that
+            # entity reading an absent table and reporting "Off" forever for
+            # anyone who turned the light platform off. The condition mirrors
+            # the one select.py creates it under, so nothing else over-fetches.
+            if self._supports_lighting_v2 and (
+                    self._wanted_by(LIGHT)
+                    or (self.is_amcrest_doorbell()
+                        and self.supports_security_light()
+                        and self._wanted_by(SELECT))):
                 coros.append(asyncio.ensure_future(self.client.async_get_lighting_v2()))
             if (getattr(self, "_supports_lighting_scheme_illuminator", False)
                     and self._wanted_by(LIGHT)):
@@ -1740,6 +1822,17 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
         if code == "CrossLineDetection" or code == "CrossRegionDetection":
             data = event.get("data", event.get("Data", {}))
+            # parse_event turns the payload into a dict, but only when it is
+            # valid JSON. A device whose payload arrives truncated leaves the
+            # raw string here, and .get() on a string raises AttributeError --
+            # out of this call, out of handle_event, out of on_receive, and out
+            # of the stream loop, which wraps it in try/finally with no handler.
+            # One malformed CrossLine event therefore took the event stream for
+            # every channel on the host down with it (#475). A payload we could
+            # not read is a payload with no ObjectType, not a reason to stop
+            # listening.
+            if not isinstance(data, dict):
+                data = {}
             object_type = data.get("Object", {}).get("ObjectType", "").lower()
             codes = []
 

@@ -9,7 +9,7 @@ import time
 import aiohttp
 
 from .digest import DigestAuth
-from .rpc2 import DahuaRpc2Client
+from .rpc2 import DahuaRpc2Client, Rpc2MethodRefused
 from hashlib import md5
 from urllib.parse import quote
 
@@ -83,6 +83,12 @@ _HOST_RPC2: dict = {}
 # meant eleven channels each rediscovering it, which is eleven failed logins
 # against a device that has just said it cannot do this.
 _HOST_RPC2_UNAVAILABLE: set = set()
+
+# (rpc2 key, config table) pairs the device answered but declined. Kept apart
+# from _HOST_RPC2_UNAVAILABLE on purpose: one table it will not serve says
+# nothing about the rest, and writing the host off for it costs a login on
+# every later read.
+_RPC2_TABLE_UNAVAILABLE: set = set()
 
 # The device states its own keepalive interval in the login reply. Ask slightly
 # inside it, the way the VTO keepalive already does.
@@ -312,6 +318,70 @@ class EventStreamClosed(Exception):
     action=attach by answering 200 and closing would otherwise leave no trace
     anywhere.
     """
+
+
+def _pop_complete_multipart_part(buffer: bytes, boundary: bytes):
+    """Return one complete multipart part and the bytes left after it.
+
+    Dahua includes Content-Length on event-stream parts. Once that many payload
+    bytes are buffered, the part is complete and can be delivered immediately;
+    waiting for the next boundary adds up to one heartbeat interval of latency.
+
+    Devices that omit Content-Length keep the previous next-boundary fallback.
+    """
+    start = buffer.find(boundary)
+    if start == -1:
+        return None, buffer
+    if start:
+        buffer = buffer[start:]
+
+    header_end = buffer.find(b"\r\n\r\n", len(boundary))
+    separator_len = 4
+    if header_end == -1:
+        header_end = buffer.find(b"\n\n", len(boundary))
+        separator_len = 2
+    if header_end == -1:
+        return None, buffer
+
+    payload_start = header_end + separator_len
+    content_length = None
+    for line in buffer[len(boundary):header_end].splitlines():
+        name, separator, value = line.partition(b":")
+        if separator and name.strip().lower() == b"content-length":
+            try:
+                content_length = int(value.strip())
+            except ValueError:
+                content_length = None
+            if content_length is not None and content_length < 0:
+                content_length = None
+            break
+
+    if content_length is not None:
+        part_end = payload_start + content_length
+        next_boundary = buffer.find(boundary, payload_start)
+
+        # If the next part starts before the declared payload end, the length
+        # was wrong or the payload was truncated. The multipart framing is
+        # stronger evidence than a length that would consume into the next part.
+        if next_boundary != -1 and next_boundary < part_end:
+            return buffer[:next_boundary], buffer[next_boundary:]
+
+        if len(buffer) < part_end:
+            return None, buffer
+
+        part = buffer[:part_end]
+        remainder = buffer[part_end:]
+        # Content-Length excludes the CRLF framing before the next boundary.
+        if remainder.startswith(b"\r\n"):
+            remainder = remainder[2:]
+        elif remainder.startswith(b"\n"):
+            remainder = remainder[1:]
+        return part, remainder
+
+    next_boundary = buffer.find(boundary, payload_start)
+    if next_boundary == -1:
+        return None, buffer
+    return buffer[:next_boundary], buffer[next_boundary:]
 
 
 _CONFIG_READ = re.compile(r"configManager\.cgi\?action=getConfig&name=(.+)$")
@@ -1064,6 +1134,11 @@ class DahuaClient:
                 holder = await self._shared_rpc2()
                 params = await holder.client.get_config({"name": name})
                 return flatten_rpc2_config(name, params.get("table"))
+            except Rpc2MethodRefused:
+                # The device answered. Logging in again cannot change its mind
+                # about a table it does not serve, and dropping the shared
+                # session to retry costs a login for nothing.
+                raise
             except Exception:  # pylint: disable=broad-except
                 holder = _HOST_RPC2.get(self._rpc2_key())
                 if holder is not None:
@@ -1898,23 +1973,17 @@ class DahuaClient:
 
             buffer = b""
             async for data, _ in response.content.iter_chunks():
-                # If stream contains multipart boundaries, buffer chunks until boundary delimiters
-                # so large event payloads (e.g. ANPR JSON) are never split across TCP chunk boundaries.
+                # Buffer multipart parts across TCP chunks. Content-Length lets
+                # us deliver a complete part immediately instead of waiting for
+                # the next boundary (or the next five-second heartbeat).
                 if boundary in data or boundary in buffer:
                     buffer += data
                     while True:
-                        idx1 = buffer.find(boundary)
-                        if idx1 == -1:
-                            if len(buffer) > 131072:
+                        complete_part, buffer = _pop_complete_multipart_part(buffer, boundary)
+                        if complete_part is None:
+                            if boundary not in buffer and len(buffer) > 131072:
                                 buffer = buffer[-4096:]
                             break
-                        idx2 = buffer.find(boundary, idx1 + len(boundary))
-                        if idx2 == -1:
-                            if idx1 > 0:
-                                buffer = buffer[idx1:]
-                            break
-                        complete_part = buffer[idx1:idx2]
-                        buffer = buffer[idx2:]
                         on_receive(complete_part, channel)
                 else:
                     on_receive(data, channel)
@@ -2034,6 +2103,8 @@ class DahuaClient:
         if (allow_rpc2 and self._use_rpc2 and not self._rpc2_released
                 and self._rpc2_key() not in _HOST_RPC2_UNAVAILABLE and not verify_ok):
             match = _CONFIG_READ.search(url)
+            if match and (self._rpc2_key(), match.group(1)) in _RPC2_TABLE_UNAVAILABLE:
+                match = None    # this table only; the transport is still good
             if match:
                 try:
                     async with asyncio.timeout(TIMEOUT_SECONDS), self._host_limit:
@@ -2044,7 +2115,19 @@ class DahuaClient:
                     # off: a device that cannot serve RPC2 should not pay for
                     # the attempt on every read, but one that merely did not
                     # answer in time should not lose the transport for good.
-                    if not rpc2_failure_is_permanent(rpc2_exception):
+                    if isinstance(rpc2_exception, Rpc2MethodRefused):
+                        # The device spoke RPC2 and declined this table. Ask
+                        # CGI for it from now on, and keep the transport for
+                        # everything else -- writing the host off here is what
+                        # put a working device back on a login per call.
+                        _RPC2_TABLE_UNAVAILABLE.add(
+                            (self._rpc2_key(), match.group(1)))
+                        _LOGGER.debug(
+                            "%s does not serve %s over RPC2, using CGI for that "
+                            "table; RPC2 is still in use for the rest",
+                            self._address, match.group(1),
+                        )
+                    elif not rpc2_failure_is_permanent(rpc2_exception):
                         # Falls through to the CGI path below, like any other
                         # failure here, but without writing the host off.
                         _LOGGER.debug(
