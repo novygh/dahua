@@ -17,6 +17,7 @@ import hashlib
 from aiohttp import ClientError, ClientResponseError, ClientSession, TCPConnector
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -173,6 +174,20 @@ FAILURES_BEFORE_BACKOFF = 2
 # Guard on the exponent so the arithmetic stays sane for a device that has been
 # failing for a week. The time ceilings below are what actually bind.
 MAX_BACKOFF_DOUBLINGS = 6
+
+# How many times a host may refuse these credentials before the integration
+# stops offering them.
+#
+# Not one, because a single 401 is not proof of a wrong password: channels of
+# one NVR share a digest challenge, and a nonce that races between them is
+# refused exactly like a bad credential. Treating the first one as fatal is
+# what #714 was.
+#
+# Not many either, because a 401 only reaches here after DigestAuth has
+# already spent its own MAX_AUTH_ATTEMPTS on it, including two passes through
+# the same-nonce refusal path. A 401 that survives all of that is much more
+# likely to be real than a raw one, so the budget here can be small.
+MAX_AUTH_REFUSALS = 3
 
 # However long the poll interval is, never leave a failing device unpolled for
 # longer than this, or a device that recovers stays missing for an afternoon.
@@ -411,6 +426,33 @@ def is_onvif_channel(data: dict, channel: int) -> bool:
     visible to the recorder -- and nothing this integration asks for reaches it.
     """
     return remote_device_protocol(data, channel) == "onvif"
+
+
+# BackKeyLight State values that mean the doorbell is ringing. See
+# myhomeiot/DahuaVTO, which documents the wider set: 4 voice message,
+# 5 answered from the VTH, 6 not answered, 7 VTH calling the VTO, 8 unlock,
+# 9 unlock failed, 11 rebooted. Only a ring should raise the button sensor.
+DOORBELL_RINGING_STATES = frozenset({1, 2})
+
+
+# BackKeyLight State values that are not about ringing at all, and the event
+# each one deserves. Measured on a VTO2000A: opening the door through the
+# integration produces State 8 within a second, and no AccessControl event.
+# 9 is documented by myhomeiot/DahuaVTO as the failed counterpart.
+DOORBELL_STATE_EVENTS = {8: "DoorUnlocked", 9: "DoorUnlockFailed"}
+
+
+def doorbell_state(event: dict):
+    """The BackKeyLight State as an int, or None if it did not say.
+
+    The payload is JSON over DHIP, so this is normally already an int, but
+    nothing guarantees it and a string must not read as a different state.
+    """
+    value = event.get("Data", {}).get("State") if isinstance(event.get("Data"), dict) else None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def door_index(event: dict) -> int:
@@ -767,6 +809,28 @@ def async_host_is_unreachable(address: str) -> bool:
 
 
 @callback
+def async_record_host_auth_refusal(address: str) -> int:
+    """Note that this host refused the credentials, and say how often it has.
+
+    Keyed by host rather than by entry because the consequence is host-wide:
+    a Dahua box locks the source IP after repeated failed logins, so ten
+    channels of one NVR are ten entries renewing one lock. A per-entry count
+    would let the first entry to notice give up while the other nine kept the
+    lock alive, which is the bug one level up.
+
+    Cleared by async_record_host_success, so this only ever counts refusals
+    with nothing succeeding in between.
+    """
+    address = normalize_address(address)
+    state = _HOST_FAILURES.setdefault(
+        address,
+        {"consecutive": 0, "since": time.time(), "entry_ids": set(), "last_probe": 0},
+    )
+    state["auth_refusals"] = state.get("auth_refusals", 0) + 1
+    return state["auth_refusals"]
+
+
+@callback
 def async_record_host_success(hass: HomeAssistant, address: str) -> None:
     """The device answered, so withdraw anything we said about it.
 
@@ -937,6 +1001,24 @@ class DahuaHostEventStream:
                             "Event stream for %s still silent", self._address
                         )
             except Exception as ex:  # pylint: disable=broad-except
+                # Credentials the device is refusing must stop being offered
+                # here too, not just on the poll. This stream backs off to at
+                # most EVENT_STREAM_MAX_RETRY_SECONDS, which is well inside
+                # the half hour a Dahua box locks a source IP for -- so on its
+                # own it would keep renewing the lock that #729 is about, and
+                # the reauth the coordinator asked for would still be refused.
+                #
+                # The count is shared with the polls and cleared by any
+                # success on this host, so a stream cannot reach the budget
+                # while anything here is still authenticating.
+                if isinstance(ex, ClientResponseError) and ex.status == 401:
+                    refusals = async_record_host_auth_refusal(self._address)
+                    if refusals >= MAX_AUTH_REFUSALS:
+                        _LOGGER.warning(
+                            "Event stream for %s stopped: the device refused these credentials %d times. It will start again once the credentials are re-entered",
+                            self._address, refusals,
+                        )
+                        return
                 # Say it once per outage, not once per retry. Silence was the
                 # old behaviour and it is why these failures went unreported;
                 # a warning every sixty seconds forever is the other extreme.
@@ -1110,7 +1192,12 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
         # A dictionary of event name (CrossLineDetection, VideoMotion, etc) to a listener for that event
         # The key will be formed from self.get_event_key(event_name) and includes the channel
-        self._dahua_event_listeners: Dict[str, CALLBACK_TYPE] = dict()
+        # A list, not one listener: two entities can want the same event, and
+        # assignment meant the second silently replaced the first. Only the
+        # binary sensor subscribed until now, one per code, so nothing had
+        # collided yet -- but a doorbell press is wanted by a binary sensor and
+        # an event entity at once (#715).
+        self._dahua_event_listeners: Dict[str, list] = dict()
 
         # A dictionary of event name (CrossLineDetection, VideoMotion, etc) to the time the event fire or was cleared.
         # If cleared the time will be 0. The time unit is seconds epoch
@@ -1249,6 +1336,42 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         still empty then and everything would be skipped on the first poll.
         """
         return any(self.config_entry.options.get(platform, True) for platform in platforms)
+
+    def _auth_refused(self, exception) -> Exception:
+        """What to raise when the device refuses these credentials.
+
+        Below the budget this is an ordinary failed poll, because one 401 is
+        not proof of a wrong password (#714).
+
+        At the budget it is ConfigEntryAuthFailed, rather than calling
+        async_start_reauth by hand and raising UpdateFailed. Home Assistant
+        does two things for that exception and only the first was happening:
+        it opens the reauth flow, and it stops scheduling refreshes --
+
+            if not auth_failed and self._listeners and not self.hass.is_stopping:
+                self._schedule_refresh()
+
+        Stopping the polls is the part that matters. A Dahua box locks the
+        source IP for thirty minutes after repeated failed logins, so an entry
+        that keeps polling keeps renewing the lock, and the correct password
+        typed into the reauth dialog is refused along with everything else.
+        That is the loop in #729: reauth asked for, reauth impossible.
+        """
+        refusals = async_record_host_auth_refusal(self._address)
+        if refusals < MAX_AUTH_REFUSALS:
+            _LOGGER.debug(
+                "Authentication refused by %s (%d of %d). Not treating it as a wrong password yet",
+                self._address, refusals, MAX_AUTH_REFUSALS,
+            )
+            self._back_off_poll_interval(
+                async_record_host_failure(self.hass, self._address, self.config_entry.entry_id)
+            )
+            return UpdateFailed("Authentication refused by " + self._address)
+        _LOGGER.warning(
+            "%s has refused these credentials %d times, so Home Assistant will stop trying them and ask for new ones. Repeated failed logins can lock a Dahua device out for around thirty minutes, so polling stops until the credentials are re-entered",
+            self._address, refusals,
+        )
+        return ConfigEntryAuthFailed("Authentication failed for " + self._address)
 
     async def _async_update_data(self):
         """Reload the camera information"""
@@ -1497,9 +1620,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 self.initialized = True
             except ClientResponseError as exception:
                 if exception.status == 401:
-                    _LOGGER.warning("Authentication failed for %s, starting reauth", self._address)
-                    self.config_entry.async_start_reauth(self.hass)
-                    raise UpdateFailed("Authentication failed") from exception
+                    raise self._auth_refused(exception) from exception
                 _LOGGER.warning("Failed to initialize device at %s: %s", self._address, exception)
                 self._back_off_poll_interval(
                     async_record_host_failure(self.hass, self._address, self.config_entry.entry_id)
@@ -1614,6 +1735,10 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             self._restore_poll_interval()
             return data
         except Exception as exception:
+            # A 401 out here never started a reauth at all: the entry just went
+            # unavailable and kept polling, which is the other half of #729.
+            if isinstance(exception, ClientResponseError) and exception.status == 401:
+                raise self._auth_refused(exception) from exception
             detail = describe_update_failure(exception)
             _LOGGER.warning("Failed to sync device state for %s: %s. See README to enable debug logs to get full exception",
                             self._address, detail)
@@ -1702,52 +1827,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         #    "Index":-1
         # }
 
-        # This is the event code, example: VideoMotion, CrossLineDetection, BackKeyLight, PhoneCallDetect, DoorStatus, etc
-        codes = self.translate_event_code(event)
-
-        for code in codes:
-            event_key = self.get_event_key(code)
-
-            if code == "AccessControl":
-                card_id = event.get("Data", {}).get("CardNo", "")
-                if card_id:
-                    card_id_md5 = hashlib.md5(card_id.encode()).hexdigest()
-                    self.hass.async_create_task(
-                        async_scan_tag(self.hass, card_id_md5, self.get_device_name())
-                    )
-
-            listener = self._dahua_event_listeners.get(event_key)
-            if listener is not None:
-                action = event.get("Action", "")
-                if action == "Start":
-                    self._dahua_event_timestamp[event_key] = int(time.time())
-                    listener()
-                elif action == "Stop":
-                    self._dahua_event_timestamp[event_key] = 0
-                    listener()
-                elif action == "Pulse":
-                    if code == "DoorStatus":
-                        # The door number is in Index, and it was being thrown
-                        # away. A VTO with an access control extension module
-                        # has a second door whose events carry Index 1 (#488),
-                        # and every one of them landed on the single Door Status
-                        # sensor -- so door 2 closing reported door 1 as closed
-                        # while it stood open. One sensor exists, it is door 1's,
-                        # and only door 1 may write to it.
-                        if door_index(event) != 0:
-                            continue
-                        if event.get("Data", {}).get("Status", "") == "Open":
-                            self._dahua_event_timestamp[event_key] = int(time.time())
-                        else:
-                            self._dahua_event_timestamp[event_key] = 0
-                    else:
-                        state = event.get("Data", {}).get("State", 0)
-                        if state == 1:
-                            # button pressed
-                            self._dahua_event_timestamp[event_key] = int(time.time())
-                        else:
-                            self._dahua_event_timestamp[event_key] = 0
-                    listener()
+        # DHIP capitalises it; the CGI stream does not.
+        self._dispatch_event(event, event.get("Action", ""))
 
     def on_receive(self, data_bytes: bytes, channel: int):
         """
@@ -1778,6 +1859,78 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             if index == self._channel:
                 self.handle_event(event)
 
+    def _dispatch_event(self, event: dict, action: str) -> None:
+        """Apply one event to this channel's sensors, whichever stream it came from.
+
+        The two streams spell the action differently -- DHIP sends "Action",
+        the CGI wire format parses to "action" -- and everything after that is
+        the same. It is shared because it did not used to be: the CGI path had
+        no Pulse branch and no NFC tag scan, so on that transport every Pulse
+        event reached the event bus and then updated nothing, and an
+        AccessControl card was never handed to async_scan_tag. Both behaviours
+        existed on the doorbell path the whole time.
+        """
+        for code in self.translate_event_code(event):
+            event_key = self.get_event_key(code)
+
+            if code == "AccessControl":
+                card_id = event.get("Data", {}).get("CardNo", "")
+                if card_id:
+                    card_id_md5 = hashlib.md5(card_id.encode()).hexdigest()
+                    self.hass.async_create_task(
+                        async_scan_tag(self.hass, card_id_md5, self.get_device_name())
+                    )
+
+            listeners = self._dahua_event_listeners.get(event_key)
+            if not listeners:
+                continue
+
+            if action == "Start":
+                self._dahua_event_timestamp[event_key] = int(time.time())
+            elif action == "Stop":
+                self._dahua_event_timestamp[event_key] = 0
+            elif action == "Pulse":
+                if code == "DoorStatus":
+                    # The door number is in Index, and it was being thrown
+                    # away. A VTO with an access control extension module
+                    # has a second door whose events carry Index 1 (#488),
+                    # and every one of them landed on the single Door Status
+                    # sensor -- so door 2 closing reported door 1 as closed
+                    # while it stood open. One sensor exists, it is door 1's,
+                    # and only door 1 may write to it.
+                    if door_index(event) != 0:
+                        continue
+                    if event.get("Data", {}).get("Status", "") == "Open":
+                        self._dahua_event_timestamp[event_key] = int(time.time())
+                    else:
+                        self._dahua_event_timestamp[event_key] = 0
+                else:
+                    # BackKeyLight carries the VTO's call state, and more than
+                    # one value means ringing. myhomeiot/DahuaVTO documents
+                    # 1 and 2 as Call/Ring (4 voice message, 5 answered,
+                    # 6 not answered, 8 unlock, 11 rebooted), and its reference
+                    # automation treats `State | int in [1, 2]` as the ring.
+                    # Only 1 was accepted here, so a device that reports 2
+                    # never raised the sensor at all.
+                    #
+                    # That project also warns the values vary by model, so this
+                    # widens what counts as a ring rather than claiming a
+                    # complete mapping.
+                    state = event.get("Data", {}).get("State", 0)
+                    try:
+                        pressed = int(state) in DOORBELL_RINGING_STATES
+                    except (TypeError, ValueError):
+                        pressed = False
+                    if pressed:
+                        self._dahua_event_timestamp[event_key] = int(time.time())
+                    else:
+                        self._dahua_event_timestamp[event_key] = 0
+            else:
+                continue
+
+            for listener in listeners:
+                listener()
+
     def handle_event(self, event: dict):
         """Handle one event the host stream has decided belongs to this channel."""
         _LOGGER.debug(
@@ -1799,18 +1952,9 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         # We'll reset it to 0 when the event stops.
         # We'll use these timestamps in binary_sensor to know how long to trigger the sensor
 
-        # This is the event code, example: VideoMotion, CrossLineDetection, etc
-        for event_name in self.translate_event_code(event):
-            event_key = self.get_event_key(event_name)
-            listener = self._dahua_event_listeners.get(event_key)
-            if listener is not None:
-                action = event.get("action")
-                if action == "Start":
-                    self._dahua_event_timestamp[event_key] = int(time.time())
-                    listener()
-                elif action == "Stop":
-                    self._dahua_event_timestamp[event_key] = 0
-                    listener()
+        # The wire format is "Code=VideoMotion;action=Start;index=0", so the
+        # action arrives lowercased here and capitalised on the DHIP path.
+        self._dispatch_event(event, event.get("action", ""))
 
     def translate_event_code(self, event: dict):
         """
@@ -1837,17 +1981,17 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
             codes = []
 
             # Always include the original CrossLine/CrossRegion if a listener exists
-            if self._dahua_event_listeners.get(self.get_event_key(code)) is not None:
+            if self._dahua_event_listeners.get(self.get_event_key(code)):
                 codes.append(code)
 
             # Also include SmartMotion translation if applicable
             if object_type == "human":
-                if self._dahua_event_listeners.get(self.get_event_key("SmartMotionHuman")) is not None:
+                if self._dahua_event_listeners.get(self.get_event_key("SmartMotionHuman")):
                     codes.append("SmartMotionHuman")
                 elif not codes:
                     codes.append("SmartMotionHuman")
             elif object_type == "vehicle":
-                if self._dahua_event_listeners.get(self.get_event_key("SmartMotionVehicle")) is not None:
+                if self._dahua_event_listeners.get(self.get_event_key("SmartMotionVehicle")):
                     codes.append("SmartMotionVehicle")
                 elif not codes:
                     codes.append("SmartMotionVehicle")
@@ -1857,6 +2001,20 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         # Convert doorbell pressed related events to common event name, DoorbellPressed.
         # VTO devices will use the event BackKeyLight and the Amcrest devices seem to use PhoneCallDetect
         if code == "BackKeyLight" or code == "PhoneCallDetect":
+            # BackKeyLight is the VTO's call state, and ringing is only part of
+            # what it reports. Collapsing every one of them to DoorbellPressed
+            # threw the rest away on arrival -- an unlock arrives as State 8
+            # and was read only as "not a ring", so it silently cleared the
+            # button sensor and nothing could ever see the unlock itself.
+            #
+            # Measured on a VTO2000A, pressing the integration's own Open Door
+            # button: 0.7s later the device sent
+            #   Code=BackKeyLight Action=Pulse Data={"State": 8}
+            # and no AccessControl event at all, so this is the only signal a
+            # door-lock entity could confirm an unlock from.
+            extra = DOORBELL_STATE_EVENTS.get(doorbell_state(event))
+            if extra:
+                return ["DoorbellPressed", extra]
             return ["DoorbellPressed"]
 
         return [code]
@@ -1873,7 +2031,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """ Adds an event listener for the given event (CrossLineDetection, etc).
         This callback will be called when the event fire """
         event_key = self.get_event_key(event_name)
-        self._dahua_event_listeners[event_key] = listener
+        self._dahua_event_listeners.setdefault(event_key, []).append(listener)
 
     def supports_disarming_linkage(self) -> bool:
         """Whether the device answered the disarming linkage read during setup."""
