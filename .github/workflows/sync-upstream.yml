@@ -1,19 +1,12 @@
 name: Sync upstream and publish VTO no-backchannel fork
 
 on:
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       revision:
         description: "Optional fork revision, e.g. 2 creates -r2 for the current upstream version"
         required: false
         default: ""
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/sync-upstream.yml"
 
 permissions:
   contents: write
@@ -100,8 +93,6 @@ jobs:
           )
 
           if patch not in text:
-              # Match the RTSP stream-source assignment even if upstream reformats
-              # the get_rtsp_stream_url() call across multiple lines.
               pattern = re.compile(
                   r'(?m)^        self\._stream_source = '
                   r'coordinator\.client\.get_rtsp_stream_url\(.*?^        \)\n',
@@ -174,8 +165,6 @@ jobs:
           )
           normalized_camera = local_camera.replace(patch, "", 1)
 
-          # One harmless comment edit predates the automated sync. Permit only
-          # that exact historical delta while upstream still has the old wording.
           if legacy_comment in normalized_camera and upstream_comment in upstream_camera:
               if normalized_camera.count(legacy_comment) != 1:
                   raise SystemExit("Unexpected duplicate legacy comment delta")
@@ -250,7 +239,7 @@ jobs:
           Based on upstream rroller/dahua ${UPSTREAM_VERSION}.
 
           Fork-specific change:
-          - Dahua VTO / doorbell RTSP sources append \`#backchannel=0\`.
+          - Dahua VTO / doorbell RTSP sources append `#backchannel=0`.
           - This prevents Home Assistant/go2rtc from opening the RTSP talkback backchannel and interfering with DMSS two-way audio.
           - Video and incoming audio from the VTO remain available in Home Assistant.
 
